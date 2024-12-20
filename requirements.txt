@@ -1,0 +1,12 @@
+numpy
+pandas
+scipy
+arch
+statsmodels
+duckdb
+pytest
+python-dotenv
+jupyterlab
+black
+flake8
+mypy
