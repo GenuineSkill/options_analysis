@@ -108,5 +108,7 @@ cython_debug/
 
 # Project specific ignores
 *.db
-data_manager/data/*
+data_manager/data/*.xlsx
+data_manager/data/*.csv
+data_manager/data/*.xls
 results/*
