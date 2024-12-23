@@ -12,16 +12,28 @@ logger = logging.getLogger(__name__)
 class GARCHVisualizer:
     """Visualization utilities for GARCH analysis"""
     
-    def __init__(self, style: str = 'seaborn-darkgrid'):
+    def __init__(self, style: str = 'seaborn'):
         """
         Initialize visualizer
         
         Parameters:
         -----------
         style : str
-            Matplotlib style to use
+            Matplotlib style to use. Default is 'seaborn'.
+            Available styles can be listed with `plt.style.available`
         """
-        plt.style.use(style)
+        # Set style safely with fallback options
+        try:
+            plt.style.use(style)
+        except OSError:
+            try:
+                # Try seaborn's default style
+                plt.style.use('seaborn')
+            except OSError:
+                # Fallback to matplotlib's default
+                plt.style.use('default')
+                logger.warning(f"Style '{style}' not found, using default style")
+        
         self.colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
         
     def plot_garch_forecasts(self,
@@ -46,6 +58,9 @@ class GARCHVisualizer:
         save_path : Path, optional
             Path to save figure
         """
+        if len(dates) == 0 or len(forecasts) == 0 or len(model_types) == 0:
+            raise ValueError("Empty input data")
+        
         fig, ax = plt.subplots(figsize=(12, 6))
         
         for i, (forecast, model) in enumerate(zip(forecasts, model_types)):
