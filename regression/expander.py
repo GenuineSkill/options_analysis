@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 import logging
-from datetime import datetime
+from datetime import datetime, date
 
 from data_manager.database import GARCHDatabase
 from garch.forecaster import GARCHForecaster, ForecastWindow
@@ -44,85 +44,54 @@ class ExpandingWindowAnalyzer:
             step_size=step_size
         )
         
-    def process_index(self,
-                    index_id: str,
-                    returns: np.ndarray,
-                    dates: np.ndarray,
-                    implied_vols: pd.DataFrame,
-                    forecast_horizon: int = 252) -> pd.DataFrame:
-        """
-        Process expanding windows for a single index
-        
-        Parameters:
-        -----------
-        index_id : str
-            Identifier for the equity index
-        returns : array-like
-            Return series to analyze
-        dates : array-like
-            Dates corresponding to returns
-        implied_vols : DataFrame
-            Implied volatility data with columns for different tenors
-        forecast_horizon : int
-            Horizon for forecasts in days
-            
-        Returns:
-        --------
-        DataFrame
-            Results including error correction terms
-        """
-        # Validate inputs
-        if len(returns) != len(dates):
-            raise ValueError("Length mismatch between returns and dates")
-        if len(dates) != len(implied_vols):
-            raise ValueError("Length mismatch between dates and implied_vols")
+    def get_last_processed_date(self, index_id: str) -> Optional[date]:
+        """Get the last processed date for an index from the database"""
+        # For now, always start from beginning
+        return None
+
+    def process_window(self, window: np.ndarray, implied_vols: np.ndarray) -> Dict:
+        """Process a single window of data"""
+        # Basic window processing
+        return {
+            'window_size': len(window),
+            'window_mean': float(np.mean(window)),
+            'window_std': float(np.std(window)),
+            'implied_vols_mean': float(np.mean(implied_vols))
+        }
+
+    def process_index(self, index_id: str, dates: List[date], returns: np.ndarray, 
+                     implied_vols: np.ndarray) -> Dict:
+        """Process expanding windows for a given index"""
+        logger = logging.getLogger('regression.expander')
         
         try:
-            # Get latest window from database
-            latest = self.db.get_latest_window(index_id)
-            
-            # Determine start point
-            if latest is not None:
-                start_idx = np.where(dates > latest['end_date'])[0][0]
-                logger.info(f"Continuing from {dates[start_idx]} for {index_id}")
-            else:
-                start_idx = 0
-                logger.info(f"Starting new analysis for {index_id}")
-            
-            # Generate expanding windows
+            # Start from beginning of dataset
+            logger.info(f"Starting new analysis for {index_id}")
+            start_idx = 0
+                
+            # Process all data
             windows = self.forecaster.generate_expanding_windows(
-                returns=returns[start_idx:],
-                dates=dates[start_idx:],
-                forecast_horizon=forecast_horizon
-            )
-            
-            # Store results
-            for window in windows:
-                self.db.store_forecast_window(window, index_id)
-            
-            # Calculate error correction terms
-            results_df = self._calculate_error_correction(
-                dates=dates,
                 returns=returns,
-                implied_vols=implied_vols,
-                forecast_windows=windows
+                start_idx=start_idx,
+                min_window=self.forecaster.min_window
             )
             
-            # Debug check before accessing end_date
-            if 'end_date' not in results_df.columns:
-                logger.error(f"Available columns: {results_df.columns.tolist()}")
-                raise KeyError("Missing end_date column")
-            
-            # Add date column explicitly, only if we have results
-            if not results_df.empty:
-                results_df['date'] = pd.to_datetime(results_df['end_date'])
-            
-            return results_df
+            # Process each window
+            results = []
+            for window in windows:
+                result = self.process_window(window, implied_vols)
+                results.append(result)
+                
+            return {
+                'index_id': index_id,
+                'dates': dates,
+                'results': results
+            }
             
         except Exception as e:
             logger.error(f"Error processing {index_id}: {str(e)}")
             raise
-            
+    
     def _calculate_error_correction(self, 
                               dates: np.ndarray,
                               returns: np.ndarray,

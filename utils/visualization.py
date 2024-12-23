@@ -277,6 +277,48 @@ class GARCHVisualizer:
         
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close_all()
+        
+    def plot_results(self, results: Dict, output_path: Path, show_plots: bool = False):
+        """Plot analysis results and save to output directory"""
+        try:
+            # Create output directory if it doesn't exist
+            output_path.mkdir(parents=True, exist_ok=True)
+            
+            # Extract data
+            dates = results['dates']
+            window_sizes = [r['window_size'] for r in results['results']]
+            means = [r['window_mean'] for r in results['results']]
+            stds = [r['window_std'] for r in results['results']]
+            iv_means = [r['implied_vols_mean'] for r in results['results']]
+            
+            # Plot window statistics
+            plt.figure(figsize=(12, 8))
+            plt.subplot(2, 1, 1)
+            plt.plot(dates[-len(means):], means, label='Rolling Mean')
+            plt.plot(dates[-len(stds):], stds, label='Rolling Std')
+            plt.title(f"Rolling Statistics - {results['index_id']}")
+            plt.legend()
+            plt.grid(True)
+            
+            # Plot implied volatilities
+            plt.subplot(2, 1, 2)
+            plt.plot(dates[-len(iv_means):], iv_means, label='Implied Vol Mean')
+            plt.title(f"Implied Volatilities - {results['index_id']}")
+            plt.legend()
+            plt.grid(True)
+            
+            # Save plot
+            plt.tight_layout()
+            plt.savefig(output_path / f"{results['index_id']}_analysis.png")
+            
+            if show_plots:
+                plt.show()
+                
+            plt.close()
+            
+        except Exception as e:
+            logging.getLogger('utils.visualization').error(f"Error plotting results: {str(e)}")
+            raise
 
 # Example usage
 if __name__ == '__main__':
