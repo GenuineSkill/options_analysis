@@ -141,23 +141,33 @@ class ExpandingWindowAnalyzer:
             try:
                 # Get window information
                 start_date = pd.to_datetime(window.start_date)
-                
-                # Calculate end date (assuming business days)
                 end_date = pd.date_range(start=start_date, periods=len(window.returns), freq='B')[-1]
                 
-                logger.info(f"Window {i}: start={start_date}, calculated_end={end_date}")
-                
+                # Create base result
                 result = {
                     'start_date': start_date,
                     'end_date': end_date
                 }
                 
-                # Add ensemble statistics if available
-                if hasattr(window, 'ensemble_stats') and window.ensemble_stats:
-                    result.update(window.ensemble_stats)
+                # Detailed inspection of ensemble stats
+                if hasattr(window, 'ensemble_stats'):
+                    if window.ensemble_stats:
+                        logger.info(f"Window {i} stats: {window.ensemble_stats}")
+                        for key, value in window.ensemble_stats.items():
+                            if pd.isna(value):
+                                logger.warning(f"Window {i}: NaN found in {key}")
+                        result.update(window.ensemble_stats)
+                    else:
+                        logger.warning(f"Window {i}: Empty ensemble_stats dictionary")
                 else:
-                    logger.warning(f"Window {i} missing ensemble stats")
+                    logger.warning(f"Window {i}: No ensemble_stats attribute")
                     
+                # Check window data
+                logger.info(f"Window {i} data summary:")
+                logger.info(f"  - Returns length: {len(window.returns)}")
+                logger.info(f"  - Start date: {start_date}")
+                logger.info(f"  - End date: {end_date}")
+                
                 results.append(result)
                 
             except Exception as e:
@@ -176,7 +186,16 @@ class ExpandingWindowAnalyzer:
             if col in results_df.columns:
                 results_df[col] = pd.to_datetime(results_df[col])
         
-        logger.info(f"Final DataFrame columns: {results_df.columns.tolist()}")
+        # Analyze NaN patterns
+        for col in results_df.columns:
+            nan_count = results_df[col].isna().sum()
+            if nan_count > 0:
+                logger.warning(f"Column {col} has {nan_count} NaN values")
+                
+        # Show first row with NaNs
+        nan_rows = results_df[results_df.isna().any(axis=1)]
+        if not nan_rows.empty:
+            logger.warning(f"First row with NaNs:\n{nan_rows.iloc[0]}")
         
         return results_df
     
