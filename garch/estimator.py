@@ -114,12 +114,33 @@ class GARCHEstimator:
                     
                 # Generate multi-step forecasts using persistence
                 forecast_variance = np.zeros(forecast_horizon)
-                persistence = result.params['alpha[1]'] + result.params['beta[1]']
+                raw_persistence = result.params['alpha[1]'] + result.params['beta[1]']
                 if model_type == 'GJR-GARCH':
-                    persistence += result.params['gamma[1]'] / 2
-                    
-                for h in range(forecast_horizon):
-                    forecast_variance[h] = base_variance * (persistence ** h)
+                    raw_persistence += result.params['gamma[1]'] / 2
+
+                # Cap persistence and log the value
+                persistence = min(raw_persistence, 0.97)  # More conservative cap
+                if raw_persistence != persistence:
+                    logger.info(f"Capped persistence from {raw_persistence:.3f} to {persistence:.3f}")
+
+                # Initialize with base variance
+                forecast_variance[0] = base_variance
+                logger.debug(f"Initial variance: {base_variance:.6f}")
+
+                # Generate subsequent forecasts with safety checks
+                for h in range(1, forecast_horizon):
+                    try:
+                        # Calculate next forecast
+                        forecast_variance[h] = base_variance * (persistence ** h)
+                        
+                        # Sanity check
+                        if not np.isfinite(forecast_variance[h]):
+                            logger.warning(f"Non-finite forecast at horizon {h}, using previous value")
+                            forecast_variance[h] = forecast_variance[h-1]
+                            
+                    except Exception as e:
+                        logger.warning(f"Error at horizon {h}: {str(e)}, using previous value")
+                        forecast_variance[h] = forecast_variance[h-1]
                     
                 # Convert variance to volatility and annualize
                 forecast_volatility = np.sqrt(forecast_variance)

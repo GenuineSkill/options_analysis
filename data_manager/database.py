@@ -137,13 +137,13 @@ class GARCHDatabase:
             }
         return None
 
-    def get_ensemble_stats_series(self, 
+    def get_ensemble_stats_series(self,
                                 index_id: str,
                                 start_date: Optional[datetime] = None,
                                 end_date: Optional[datetime] = None) -> pd.DataFrame:
         """Get time series of ensemble statistics"""
-        query = """
-            SELECT 
+        query = f"""
+            SELECT
                 w.end_date::DATE as date,
                 e.gev as "GEV",
                 e.evoev as "EVOEV",
@@ -152,26 +152,18 @@ class GARCHDatabase:
                 e.sevts as "SEVTS"
             FROM ensemble_stats e
             JOIN garch_windows w ON e.window_id = w.window_id
-            WHERE w.index_id = ?
+            WHERE w.index_id = '{index_id}'
         """
-        params = [index_id]
-        
+
         if start_date:
-            query += " AND w.end_date >= ?"
-            params.append(start_date)
+            query += f" AND w.end_date >= DATE '{str(start_date)[:10]}'"
         if end_date:
-            query += " AND w.end_date <= ?"
-            params.append(end_date)
-            
+            query += f" AND w.end_date <= DATE '{str(end_date)[:10]}'"
+
         query += " ORDER BY w.end_date"
         
-        results = self.conn.execute(query, params).fetchall()
-        if not results:
-            return pd.DataFrame()
-            
-        df = pd.DataFrame(results, columns=['date', 'GEV', 'EVOEV', 'DEV', 'KEV', 'SEVTS'])
-        df.set_index('date', inplace=True)
-        return df
+        results = self.conn.execute(query).fetchall()
+        return pd.DataFrame(results, columns=['date', 'GEV', 'EVOEV', 'DEV', 'KEV', 'SEVTS']).set_index('date')
 
     def get_model_forecasts(self,
                           window_id: int,
@@ -199,3 +191,11 @@ class GARCHDatabase:
         """Close database connection"""
         if hasattr(self, 'conn'):
             self.conn.close()
+
+    def is_closed(self) -> bool:
+        """Check if database connection is closed"""
+        try:
+            self.conn.execute("SELECT 1")
+            return False
+        except:
+            return True
