@@ -128,45 +128,77 @@ class ExpandingWindowAnalyzer:
                               returns: np.ndarray,
                               implied_vols: pd.DataFrame,
                               forecast_windows: List[ForecastWindow]) -> pd.DataFrame:
-        """Calculate error correction terms"""
+        """Calculate error correction terms
         
+        Note on statistic availability:
+        - SEVTS becomes valid immediately (requires only endpoint forecasts)
+        - GEV, EVOEV, DEV, and KEV require full forecast sequences
+        - Expect ~3 windows before all statistics become valid
+        - Some windows may have NaN values due to forecast availability
+        
+        Parameters:
+        -----------
+        dates : array-like
+            Dates corresponding to returns
+        returns : array-like
+            Return series to analyze
+        implied_vols : DataFrame
+            Implied volatility data
+        forecast_windows : List[ForecastWindow]
+            Windows containing GARCH results
+        
+        Returns:
+        --------
+        DataFrame
+            Results including all statistics, with expected NaN pattern:
+            - SEVTS: Valid from first window
+            - Other stats: Valid from ~window 3
+            - Occasional NaN windows may occur
+        """
         if not forecast_windows:
             logger.warning("No forecast windows provided")
             return pd.DataFrame()
         
-        logger.info(f"Processing {len(forecast_windows)} forecast windows")
+        print(f"\nAnalyzing {len(forecast_windows)} forecast windows...")
         
         results = []
+        transitions = {}
+        
         for i, window in enumerate(forecast_windows):
             try:
-                # Get window information
                 start_date = pd.to_datetime(window.start_date)
                 end_date = pd.date_range(start=start_date, periods=len(window.returns), freq='B')[-1]
                 
-                # Create base result
                 result = {
                     'start_date': start_date,
                     'end_date': end_date
                 }
                 
-                # Detailed inspection of ensemble stats
                 if hasattr(window, 'ensemble_stats'):
-                    if window.ensemble_stats:
-                        logger.info(f"Window {i} stats: {window.ensemble_stats}")
-                        for key, value in window.ensemble_stats.items():
-                            if pd.isna(value):
-                                logger.warning(f"Window {i}: NaN found in {key}")
-                        result.update(window.ensemble_stats)
-                    else:
-                        logger.warning(f"Window {i}: Empty ensemble_stats dictionary")
-                else:
-                    logger.warning(f"Window {i}: No ensemble_stats attribute")
+                    stats = window.ensemble_stats
                     
-                # Check window data
-                logger.info(f"Window {i} data summary:")
-                logger.info(f"  - Returns length: {len(window.returns)}")
-                logger.info(f"  - Start date: {start_date}")
-                logger.info(f"  - End date: {end_date}")
+                    # Track first valid appearance of each statistic
+                    for stat, value in stats.items():
+                        if pd.notna(value) and stat not in transitions:
+                            transitions[stat] = {
+                                'window': i,
+                                'start_date': start_date,
+                                'end_date': end_date,
+                                'value': value
+                            }
+                            print(f"\n{stat} first valid in window {i}:")
+                            print(f"  Start: {start_date.date()}")
+                            print(f"  End: {end_date.date()}")
+                            print(f"  Value: {value:.6f}")
+                            
+                            # Log GARCH details at transition
+                            if hasattr(window, 'garch_results'):
+                                n_models = len(window.garch_results)
+                                print(f"  GARCH models: {n_models}")
+                                if n_models > 0 and hasattr(window.garch_results[0], 'forecasts_annualized'):
+                                    print(f"  Forecast length: {len(window.garch_results[0].forecasts_annualized)}")
+                
+                    result.update(stats)
                 
                 results.append(result)
                 
@@ -174,28 +206,24 @@ class ExpandingWindowAnalyzer:
                 logger.warning(f"Error processing window {i}: {str(e)}")
                 continue
         
-        # Create DataFrame with window results
+        # Create DataFrame
         results_df = pd.DataFrame(results)
         
-        if results_df.empty:
-            logger.warning("No valid results to process")
-            return results_df
-        
-        # Ensure date columns are datetime
-        for col in ['start_date', 'end_date']:
-            if col in results_df.columns:
-                results_df[col] = pd.to_datetime(results_df[col])
-        
-        # Analyze NaN patterns
-        for col in results_df.columns:
-            nan_count = results_df[col].isna().sum()
-            if nan_count > 0:
-                logger.warning(f"Column {col} has {nan_count} NaN values")
+        # Print transition summary
+        print("\nTransition Summary:")
+        for stat in ['GEV', 'EVOEV', 'DEV', 'KEV', 'SEVTS']:
+            if stat in transitions:
+                info = transitions[stat]
+                print(f"\n{stat}:")
+                print(f"  First valid: Window {info['window']}")
+                print(f"  Period: {info['start_date'].date()} to {info['end_date'].date()}")
                 
-        # Show first row with NaNs
-        nan_rows = results_df[results_df.isna().any(axis=1)]
-        if not nan_rows.empty:
-            logger.warning(f"First row with NaNs:\n{nan_rows.iloc[0]}")
+                # Show pattern of values after transition
+                if stat in results_df.columns:
+                    next_values = results_df[stat].iloc[info['window']:info['window']+3]
+                    print(f"  Next three values: {next_values.tolist()}")
+            else:
+                print(f"\n{stat}: Never became valid")
         
         return results_df
     
