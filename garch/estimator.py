@@ -7,6 +7,9 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 import warnings
 import logging
+from pathlib import Path
+import pickle
+from .checkpoint import CheckpointManager
 
 # Configure logging
 logging.basicConfig(
@@ -15,40 +18,32 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Set logging level for checkpoint-related messages
+checkpoint_logger = logging.getLogger('garch.estimator')
+checkpoint_logger.setLevel(logging.INFO)  # Change to logging.DEBUG to see all checkpoint messages
+
 # Suppress known warnings from arch package
 warnings.filterwarnings('ignore', category=RuntimeWarning, message='invalid value encountered in sqrt')
 
 @dataclass
 class GARCHResult:
     """Container for GARCH estimation results"""
+    model_type: str
+    distribution: str
     params: Dict[str, float]
     forecasts_annualized: np.ndarray  # Store annualized volatility forecasts
     volatility_annualized: np.ndarray  # Store annualized historical volatilities
-    model_type: str
-    distribution: str
-    
+
 class GARCHEstimator:
     """Estimates and manages ensemble of GARCH models"""
     
-    def __init__(self, 
-                min_observations: int = 1260,
-                n_simulations: int = 1000,
-                random_seed: int = 42):
-        """
-        Initialize estimator
-        
-        Parameters:
-        -----------
-        min_observations : int
-            Minimum required observations for estimation
-        n_simulations : int
-            Number of Monte Carlo simulations for forecasting
-        random_seed : int
-            Random seed for reproducibility
-        """
-        self.min_observations = min_observations
-        self.n_simulations = n_simulations
-        self.random_seed = random_seed
+    def __init__(self, checkpoint_dir: Optional[Path] = None):
+        self.logger = logging.getLogger('garch.estimator')
+        self.checkpoint_manager = None
+        if checkpoint_dir:
+            self.checkpoint_manager = CheckpointManager(checkpoint_dir)
+            
+        # Define model specifications
         self.model_specs = [
             ('GARCH', 'normal'),
             ('GARCH', 'studentst'),
@@ -58,6 +53,8 @@ class GARCHEstimator:
             ('GJR-GARCH', 'studentst')
         ]
         
+        self.min_observations = 252  # Minimum one year of data
+            
     def _annualize_variance(self, daily_variance: np.ndarray) -> np.ndarray:
         """Convert daily variance to annualized volatility"""
         return np.sqrt(252 * daily_variance) * 100  # Convert to percentage
@@ -66,22 +63,15 @@ class GARCHEstimator:
                              returns: np.ndarray,
                              model_type: str,
                              distribution: str,
-                             forecast_horizon: int = 252) -> Optional[GARCHResult]:
+                             forecast_horizon: int = 252,
+                             n_simulations: int = 1000) -> Optional[GARCHResult]:
         """
         Estimate single GARCH model and generate forecasts
         """
         try:
-            # Handle NaN values
-            if np.any(np.isnan(returns)):
-                returns = returns[~np.isnan(returns)]
-                
-            if len(returns) < self.min_observations:
-                logger.warning(f"Insufficient observations after removing NaN values: {len(returns)}")
-                return None
-                
-            # Scale returns to percentage points for better numerical stability
+            # Convert returns to percentage
             returns_pct = returns * 100
-                
+            
             # Configure model
             if model_type == 'GARCH':
                 model = arch_model(returns_pct, vol='Garch', p=1, q=1, dist=distribution, rescale=False)
@@ -92,159 +82,124 @@ class GARCHEstimator:
             else:
                 raise ValueError(f"Unknown model type: {model_type}")
                 
-            # Fit model with error handling
-            try:
-                result = model.fit(disp='off', show_warning=False)
-            except Exception as e:
-                logger.warning(f"Model fitting failed for {model_type}-{distribution}: {str(e)}")
-                return None
-                
-            # Generate forecasts
-            try:
-                forecasts = result.forecast(
-                    horizon=1,  # Start with 1-step forecast
-                    method='analytic'  # Use analytic instead of simulation
-                )
-                
-                # Get base volatility forecast
-                base_variance = forecasts.variance.values[-1][0]
-                if np.isnan(base_variance) or base_variance <= 0:
-                    logger.warning(f"Invalid base variance for {model_type}-{distribution}")
-                    return None
-                    
-                # Generate multi-step forecasts using persistence
-                forecast_variance = np.zeros(forecast_horizon)
-                raw_persistence = result.params['alpha[1]'] + result.params['beta[1]']
-                if model_type == 'GJR-GARCH':
-                    raw_persistence += result.params['gamma[1]'] / 2
-
-                # Cap persistence and log the value
-                persistence = min(raw_persistence, 0.97)  # More conservative cap
-                if raw_persistence != persistence:
-                    logger.info(f"Capped persistence from {raw_persistence:.3f} to {persistence:.3f}")
-
-                # Initialize with base variance
-                forecast_variance[0] = base_variance
-                logger.debug(f"Initial variance: {base_variance:.6f}")
-
-                # Generate subsequent forecasts with safety checks
-                for h in range(1, forecast_horizon):
-                    try:
-                        # Calculate next forecast
-                        forecast_variance[h] = base_variance * (persistence ** h)
-                        
-                        # Sanity check
-                        if not np.isfinite(forecast_variance[h]):
-                            logger.warning(f"Non-finite forecast at horizon {h}, using previous value")
-                            forecast_variance[h] = forecast_variance[h-1]
-                            
-                    except Exception as e:
-                        logger.warning(f"Error at horizon {h}: {str(e)}, using previous value")
-                        forecast_variance[h] = forecast_variance[h-1]
-                    
-                # Convert variance to volatility and annualize
-                forecast_volatility = np.sqrt(forecast_variance)
-                forecast_volatility_annualized = forecast_volatility * np.sqrt(252) / 100
-                historical_volatility_annualized = np.sqrt(result.conditional_volatility) * np.sqrt(252) / 100
-                
-                return GARCHResult(
-                    params=dict(result.params),
-                    forecasts_annualized=forecast_volatility_annualized,
-                    volatility_annualized=historical_volatility_annualized,
-                    model_type=model_type,
-                    distribution=distribution
-                )
-                
-            except Exception as e:
-                logger.warning(f"Forecast generation failed for {model_type}-{distribution}: {str(e)}")
-                return None
+            # Fit model
+            result = model.fit(disp='off', show_warning=False)
+            
+            # Generate forecasts - use simulation for all models to ensure consistency
+            forecasts = result.forecast(horizon=forecast_horizon, method='simulation', 
+                                     simulations=n_simulations)
+            
+            # Get mean variance across simulations
+            forecast_variance = forecasts.variance.mean(axis=1).values[-forecast_horizon:]
+            
+            # Convert to annualized volatility (scalar, not array)
+            forecast_volatility = np.sqrt(forecast_variance)
+            forecast_volatility_annualized = float(forecast_volatility.mean() * np.sqrt(252))
+            historical_volatility_annualized = float(np.sqrt(result.conditional_volatility[-1]) * np.sqrt(252))
+            
+            return GARCHResult(
+                model_type=model_type,
+                distribution=distribution,
+                params=dict(result.params),
+                forecasts_annualized=forecast_volatility_annualized,  # Now a scalar
+                volatility_annualized=historical_volatility_annualized  # Now a scalar
+            )
                 
         except Exception as e:
-            logger.error(f"Error estimating {model_type}-{distribution}: {str(e)}")
+            self.logger.warning(f"Error estimating {model_type}-{distribution}: {str(e)}")
             return None
             
-    def estimate_models(self, 
-                       returns: np.ndarray,
-                       forecast_horizon: int = 252,
-                       parallel: bool = True) -> List[GARCHResult]:
-        """Estimate all GARCH models in parallel"""
-        
-        if len(returns) < self.min_observations:
-            raise ValueError(f"Insufficient observations: {len(returns)} < {self.min_observations}")
+    def estimate(self, returns: np.ndarray, date: pd.Timestamp) -> List[GARCHResult]:
+        """Estimate all GARCH models with checkpointing"""
+        try:
+            # Initialize counters for progress tracking
+            total_models = len(self.model_specs)
+            loaded_from_checkpoint = 0
+            estimated_new = 0
             
-        if parallel:
-            with ProcessPoolExecutor() as executor:
-                futures = [
-                    executor.submit(
-                        self._estimate_single_model,
-                        returns,
-                        model_type,
-                        distribution,
-                        forecast_horizon
+            # Try to load from checkpoint first
+            if self.checkpoint_manager:
+                checkpoint = self.checkpoint_manager.load_checkpoint(date)
+                if checkpoint and self._validate_checkpoint(checkpoint):
+                    self.logger.debug(f"Loaded valid checkpoint for {date}")
+                    loaded_from_checkpoint = len(checkpoint)
+                    return checkpoint
+            
+            # Estimate all models
+            results = []
+            for i, (model_type, distribution) in enumerate(self.model_specs, 1):
+                try:
+                    result = self._estimate_single_model(
+                        returns=returns,
+                        model_type=model_type,
+                        distribution=distribution
                     )
-                    for model_type, distribution in self.model_specs
-                ]
-                results = [f.result() for f in futures]
-        else:
-            results = [
-                self._estimate_single_model(
-                    returns,
-                    model_type,
-                    distribution,
-                    forecast_horizon
-                )
-                for model_type, distribution in self.model_specs
-            ]
+                    if result is not None:
+                        results.append(result)
+                        estimated_new += 1
+                        
+                    # Show progress every 2 models or when complete
+                    if i % 2 == 0 or i == total_models:
+                        progress_msg = (
+                            f"Progress for {date:%Y-%m-%d}: "
+                            f"{i}/{total_models} models processed "
+                            f"({estimated_new} estimated, {loaded_from_checkpoint} from checkpoint)"
+                        )
+                        self.logger.info(progress_msg)
+                        
+                except Exception as e:
+                    self.logger.warning(
+                        f"Failed to estimate {model_type}-{distribution} for {date:%Y-%m-%d}: {str(e)}"
+                    )
+                    continue
             
-        # Filter out failed estimations
-        return [r for r in results if r is not None]
-        
-    def calculate_ensemble_stats(self,
-                               results: List[GARCHResult],
-                               tau: int) -> Dict[str, float]:
-        """
-        Calculate ensemble statistics for horizon tau
-        
-        Args:
-            results: List of GARCH estimation results
-            tau: Forecast horizon to analyze
+            # Only save checkpoint if we got valid results
+            if self.checkpoint_manager and results and self._validate_checkpoint(results):
+                self.checkpoint_manager.save_checkpoint(date, results)
+                self.logger.debug(f"Saved checkpoint for {date}")
             
-        Returns:
-            Dictionary of ensemble statistics
-        """
-        if not results:
-            raise ValueError("No GARCH results provided")
-        
-        # Extract forecasts for each model up to tau
-        forecasts = np.array([r.forecasts_annualized[:tau] for r in results])
-        
-        if len(forecasts.shape) < 2:  # Handle single-point forecasts
-            forecasts = forecasts.reshape(-1, 1)
-        
-        # Calculate statistics
-        gev = np.mean(forecasts)  # Global Expected Volatility
-        
-        # Calculate time series statistics if we have multiple horizons
-        if forecasts.shape[1] > 1:
-            mean_forecasts = np.mean(forecasts, axis=0)
-            evoev = np.std(mean_forecasts)  # Evolution of Expected Volatility
-            dev = np.mean([np.std(forecasts[:,i]) for i in range(forecasts.shape[1])])  # Dispersion
-            kev = np.mean([stats.skew(forecasts[:,i]) for i in range(forecasts.shape[1])])  # Skewness
-            sevts = np.mean(forecasts[:,-1] - forecasts[:,0])  # Slope
-        else:
-            # Single point forecasts
-            evoev = np.std(forecasts.flatten())
-            dev = np.std(forecasts.flatten())
-            kev = stats.skew(forecasts.flatten())
-            sevts = 0.0
-        
-        return {
-            'GEV': gev,
-            'EVOEV': evoev,
-            'DEV': dev,
-            'KEV': kev,
-            'SEVTS': sevts
-        }
+            # Final progress update
+            final_msg = (
+                f"Completed {date:%Y-%m-%d}: "
+                f"{len(results)}/{total_models} models successful "
+                f"({estimated_new} estimated, {loaded_from_checkpoint} from checkpoint)"
+            )
+            self.logger.info(final_msg)
+            
+            return results
+            
+        except Exception as e:
+            self.logger.error(f"Error estimating GARCH models for {date:%Y-%m-%d}: {str(e)}")
+            raise
+
+    def _validate_checkpoint(self, results: List[GARCHResult]) -> bool:
+        """Validate checkpoint data"""
+        try:
+            if not results or len(results) == 0:
+                return False
+                
+            for result in results:
+                # Check if result has all required attributes
+                if not all(hasattr(result, attr) for attr in 
+                          ['model_type', 'distribution', 'params', 
+                           'forecasts_annualized', 'volatility_annualized']):
+                    return False
+                    
+                # Check if forecasts are valid
+                if (not isinstance(result.forecasts_annualized, np.ndarray) or 
+                    len(result.forecasts_annualized) == 0):
+                    return False
+                    
+                # Check if volatilities are valid
+                if (not isinstance(result.volatility_annualized, np.ndarray) or 
+                    len(result.volatility_annualized) == 0):
+                    return False
+                    
+            return True
+            
+        except Exception as e:
+            self.logger.warning(f"Error validating checkpoint: {str(e)}")
+            return False
 
 # Example usage
 if __name__ == '__main__':

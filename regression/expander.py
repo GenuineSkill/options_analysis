@@ -9,63 +9,128 @@ import pickle
 from data_manager.database import GARCHDatabase
 from garch.forecaster import GARCHForecaster, ForecastWindow
 from garch.estimator import GARCHEstimator
+from utils.db_manager import DatabaseManager
+from utils.progress import ProgressMonitor
 
 logger = logging.getLogger(__name__)
 
 class ExpandingWindowAnalyzer:
     """Manages expanding window analysis for implied volatility modeling"""
     
-    def __init__(self, forecaster, db_path: Optional[Path] = None):
-        """Initialize the analyzer with a forecaster and optional database path"""
+    def __init__(self, forecaster, db_manager: Optional[DatabaseManager] = None):
+        """Initialize the analyzer with a forecaster and optional database manager"""
         self.forecaster = forecaster
-        self.db_path = db_path
+        self.db_manager = db_manager
+        self.logger = logging.getLogger('regression.expander')
 
     def save_results(self, results: Dict, output_dir: Path):
         """Save analysis results to disk"""
-        logger = logging.getLogger('regression.expander')
         try:
             output_dir.mkdir(parents=True, exist_ok=True)
             results_file = output_dir / f"{results['index_id']}_results.pkl"
-            logger.info(f"Saving results to {results_file}")
+            self.logger.info(f"Saving results to {results_file}")
             with open(results_file, 'wb') as f:
                 pickle.dump(results, f)
         except Exception as e:
-            logger.error(f"Error saving results: {str(e)}")
+            self.logger.error(f"Error saving results: {str(e)}")
             raise
 
-    def process_window(self, window: np.ndarray, implied_vols: np.ndarray) -> Dict:
-        """Process a single window of data"""
-        return {
-            'window_size': len(window),
-            'window_mean': float(np.mean(window)),
-            'window_std': float(np.std(window)),
-            'implied_vols_mean': float(np.mean(implied_vols))
-        }
-
-    def process_index(self, index_id: str, dates: List[date], returns: np.ndarray, 
-                     implied_vols: np.ndarray, output_dir: Path) -> Dict:
-        """Process expanding windows for a given index"""
-        logger = logging.getLogger('regression.expander')
+    def process_window(self, window: np.ndarray, implied_vols: np.ndarray, 
+                      date: pd.Timestamp, model_type: str = 'GARCH') -> Dict:
+        """Process a single window of data and save to database"""
+        self.logger.debug(f"Processing window ending {date}")
         
         try:
-            # Start from beginning of dataset
-            logger.info(f"Starting new analysis for {index_id}")
-            logger.info(f"Analysis date range: {dates[0]} to {dates[-1]}")
-            start_idx = 0
-                
+            # Run GARCH estimation
+            garch_results = self.forecaster.estimator.estimate(
+                returns=window,
+                date=date
+            )
+            
+            # Generate forecasts
+            forecasts = self.forecaster.generate_forecasts(
+                window=window,
+                garch_results=garch_results
+            )
+            
+            # Calculate ensemble statistics
+            ensemble_stats = self.forecaster.calculate_ensemble_stats(
+                forecasts=forecasts,
+                implied_vols=implied_vols
+            )
+            
+            # Package results
+            results = {
+                'window_size': len(window),
+                'garch_results': garch_results,
+                'forecasts': forecasts,
+                'ensemble_stats': ensemble_stats
+            }
+            
+            # Save to database if available
+            if self.db_manager:
+                try:
+                    # Save GARCH parameters
+                    for model, params in garch_results.items():
+                        self.db_manager.save_garch_results(
+                            date=date,
+                            model_type=model,
+                            params=params['parameters'],
+                            converged=bool(params['converged']),
+                            loglik=float(params['loglikelihood'])
+                        )
+                    
+                    # Save forecasts
+                    for model, forecast in forecasts.items():
+                        self.db_manager.save_forecasts(
+                            estimation_date=date,
+                            model_type=model,
+                            forecasts=forecast
+                        )
+                    
+                    # Save ensemble stats
+                    self.db_manager.save_ensemble_stats(
+                        date=date,
+                        stats=ensemble_stats
+                    )
+                    
+                except Exception as e:
+                    self.logger.error(f"Error saving to database: {str(e)}")
+                    # Continue processing even if database save fails
+                    
+            return results
+            
+        except Exception as e:
+            self.logger.error(f"Error processing window ending {date}: {str(e)}")
+            raise
+
+    def process_index(self, index_id: str, dates: List[date], returns: np.ndarray, 
+                     implied_vols: np.ndarray, output_dir: Path, 
+                     monitor: Optional[ProgressMonitor] = None) -> Dict:
+        """Process expanding windows for a given index"""
+        try:
+            self.logger.info(f"Starting new analysis for {index_id}")
+            self.logger.info(f"Analysis date range: {dates[0]} to {dates[-1]}")
+            
             # Process all data
             windows = self.forecaster.generate_expanding_windows(
                 returns=returns,
-                start_idx=start_idx,
-                min_window=self.forecaster.min_window
+                start_idx=0
             )
             
             # Process each window
             results = []
-            for window in windows:
-                result = self.process_window(window, implied_vols)
+            for i, window in enumerate(windows):
+                result = self.process_window(
+                    window=window,
+                    implied_vols=implied_vols[i:i+len(window)],
+                    date=dates[i+len(window)-1]
+                )
                 results.append(result)
                 
+                if monitor:
+                    monitor.update(1)
+                    
             # Package results
             analysis_results = {
                 'index_id': index_id,
@@ -73,13 +138,13 @@ class ExpandingWindowAnalyzer:
                 'results': results
             }
             
-            # Save results before returning
+            # Save results
             self.save_results(analysis_results, output_dir)
             
             return analysis_results
             
         except Exception as e:
-            logger.error(f"Error processing {index_id}: {str(e)}")
+            self.logger.error(f"Error processing {index_id}: {str(e)}")
             raise
     
     def _calculate_error_correction(self, 

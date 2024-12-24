@@ -13,50 +13,67 @@ class GARCHDatabase:
     def __init__(self, db_path: Union[str, Path]):
         """Initialize database connection"""
         self.db_path = Path(db_path)
+        
+        # If database exists, delete it to start fresh
+        if self.db_path.exists():
+            self.db_path.unlink()
+        
+        # Create parent directory if it doesn't exist
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Connect to new database
         self.conn = duckdb.connect(str(self.db_path))
         self._initialize_tables()
 
     def _initialize_tables(self):
-        """Create database tables if they don't exist"""
-        self.conn.execute("""
-            CREATE SEQUENCE IF NOT EXISTS window_id_seq;
+        """Initialize database tables"""
+        try:
+            # Create everything in a single transaction in the correct order
+            self.conn.execute("""
+                -- Create sequence first
+                CREATE SEQUENCE IF NOT EXISTS window_id_seq;
+                
+                -- Create main table with sequence-based default
+                CREATE TABLE forecast_windows (
+                    window_id INTEGER PRIMARY KEY DEFAULT nextval('window_id_seq'),
+                    index_id TEXT NOT NULL,
+                    start_date TIMESTAMP NOT NULL,
+                    end_date TIMESTAMP NOT NULL,
+                    returns BLOB NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                
+                -- Create garch_results table
+                CREATE TABLE garch_results (
+                    window_id INTEGER,
+                    model_type TEXT NOT NULL,
+                    distribution TEXT NOT NULL,
+                    parameters TEXT NOT NULL,  -- JSON string
+                    forecasts_annualized DOUBLE NOT NULL,
+                    volatility_annualized DOUBLE NOT NULL,
+                    FOREIGN KEY (window_id) REFERENCES forecast_windows(window_id)
+                );
+                
+                -- Create dependent table with foreign key
+                CREATE TABLE ensemble_stats (
+                    window_id INTEGER,
+                    gev DOUBLE,
+                    evoev DOUBLE,
+                    dev DOUBLE,
+                    kev DOUBLE,
+                    sevts DOUBLE,
+                    n_models INTEGER,
+                    FOREIGN KEY (window_id) REFERENCES forecast_windows(window_id)
+                );
+            """)
             
-            CREATE TABLE IF NOT EXISTS garch_windows (
-                window_id BIGINT PRIMARY KEY DEFAULT nextval('window_id_seq'),
-                start_date DATE NOT NULL,
-                end_date DATE NOT NULL,
-                index_id VARCHAR NOT NULL,
-                returns BLOB NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
+            self.conn.commit()
             
-            CREATE SEQUENCE IF NOT EXISTS result_id_seq;
-            
-            CREATE TABLE IF NOT EXISTS garch_results (
-                result_id BIGINT PRIMARY KEY DEFAULT nextval('result_id_seq'),
-                window_id BIGINT NOT NULL,
-                model_type VARCHAR NOT NULL,
-                distribution VARCHAR NOT NULL,
-                parameters JSON NOT NULL,
-                forecasts_annualized BLOB NOT NULL,
-                volatility_annualized BLOB NOT NULL,
-                FOREIGN KEY(window_id) REFERENCES garch_windows(window_id)
-            );
-            
-            CREATE SEQUENCE IF NOT EXISTS stat_id_seq;
-            
-            CREATE TABLE IF NOT EXISTS ensemble_stats (
-                stat_id BIGINT PRIMARY KEY DEFAULT nextval('stat_id_seq'),
-                window_id BIGINT NOT NULL,
-                gev DOUBLE PRECISION NOT NULL,
-                evoev DOUBLE PRECISION NOT NULL,
-                dev DOUBLE PRECISION NOT NULL,
-                kev DOUBLE PRECISION NOT NULL,
-                sevts DOUBLE PRECISION NOT NULL,
-                FOREIGN KEY(window_id) REFERENCES garch_windows(window_id)
-            );
-        """)
+        except Exception as e:
+            logger.error(f"Error initializing database tables: {str(e)}")
+            if hasattr(self, 'conn'):
+                self.conn.close()
+            raise
 
     def store_forecast_window(self, window, index_id: str) -> int:
         """Store forecast window and associated results"""
@@ -67,9 +84,9 @@ class GARCHDatabase:
             if len(window.returns) == 0:
                 raise ValueError("Returns array cannot be empty")
 
-            # Store window and get ID
+            # Store window and get ID (removed window_id from INSERT fields)
             result = self.conn.execute("""
-                INSERT INTO garch_windows (start_date, end_date, index_id, returns)
+                INSERT INTO forecast_windows (start_date, end_date, index_id, returns)
                 VALUES (?, ?, ?, ?)
                 RETURNING window_id
             """, (
@@ -83,6 +100,10 @@ class GARCHDatabase:
             
             # Store GARCH results
             for result in window.garch_results:
+                # Convert scalar forecasts to numpy arrays if needed
+                forecasts = np.array([result.forecasts_annualized]) if np.isscalar(result.forecasts_annualized) else result.forecasts_annualized
+                volatility = np.array([result.volatility_annualized]) if np.isscalar(result.volatility_annualized) else result.volatility_annualized
+                
                 self.conn.execute("""
                     INSERT INTO garch_results (
                         window_id, model_type, distribution, parameters,
@@ -93,22 +114,23 @@ class GARCHDatabase:
                     result.model_type,
                     result.distribution,
                     json.dumps(result.params),
-                    result.forecasts_annualized.tobytes(),
-                    result.volatility_annualized.tobytes()
+                    float(np.mean(forecasts)),  # Store mean value
+                    float(np.mean(volatility))  # Store mean value
                 ))
             
             # Store ensemble stats
             self.conn.execute("""
                 INSERT INTO ensemble_stats (
-                    window_id, gev, evoev, dev, kev, sevts
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    window_id, gev, evoev, dev, kev, sevts, n_models
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (
                 window_id,
                 window.ensemble_stats['GEV'],
                 window.ensemble_stats['EVOEV'],
                 window.ensemble_stats['DEV'],
                 window.ensemble_stats['KEV'],
-                window.ensemble_stats['SEVTS']
+                window.ensemble_stats['SEVTS'],
+                window.ensemble_stats.get('n_models', len(window.garch_results))
             ))
             
             self.conn.commit()
@@ -122,7 +144,7 @@ class GARCHDatabase:
         """Get most recent forecast window for an index"""
         result = self.conn.execute("""
             SELECT window_id, start_date::DATE, end_date::DATE, returns
-            FROM garch_windows
+            FROM forecast_windows
             WHERE index_id = ?
             ORDER BY created_at DESC
             LIMIT 1
@@ -151,7 +173,7 @@ class GARCHDatabase:
                 e.kev as "KEV",
                 e.sevts as "SEVTS"
             FROM ensemble_stats e
-            JOIN garch_windows w ON e.window_id = w.window_id
+            JOIN forecast_windows w ON e.window_id = w.window_id
             WHERE w.index_id = '{index_id}'
         """
 

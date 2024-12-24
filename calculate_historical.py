@@ -10,13 +10,15 @@ import logging
 from datetime import datetime
 import numpy as np
 import pandas as pd
-from typing import Dict, Tuple, Any
+from typing import Dict, Tuple, Any, Optional
 import time
 import psutil
 import traceback
 from tqdm import tqdm
 import warnings
 from arch.__future__ import reindexing
+from utils.db_manager import DatabaseManager
+from utils.progress import ProgressMonitor
 
 # Add project root to path
 project_root = Path(__file__).parent
@@ -179,26 +181,27 @@ def load_spx_data(data_path: Path, logger: logging.Logger) -> Tuple[pd.DataFrame
         logger.error(f"Traceback: {traceback.format_exc()}")
         raise
 
-def initialize_components(logger: logging.Logger = None) -> Dict:
-    """Initialize all analysis components"""
+def initialize_components(logger: Optional[logging.Logger] = None,
+                        checkpoint_dir: Optional[Path] = None,
+                        db_manager: Optional[DatabaseManager] = None) -> Dict:
+    """Initialize all analysis components with optional checkpointing and database"""
     if logger is None:
         logger = logging.getLogger('historical_calculator')
         
     logger.info("Creating GARCH estimator...")
-    estimator = GARCHEstimator(
-        min_observations=1260,  # Five years as per Durham's paper
-        n_simulations=1000,
-        random_seed=42
-    )
+    estimator = GARCHEstimator(checkpoint_dir=checkpoint_dir)
     
     logger.info("Creating forecaster...")
     forecaster = GARCHForecaster(
         estimator=estimator,
-        min_window=1260  # Match estimator's minimum observations
+        min_window=1260  # Five years as per Durham's paper
     )
     
     logger.info("Creating analyzer...")
-    analyzer = ExpandingWindowAnalyzer(forecaster=forecaster)
+    analyzer = ExpandingWindowAnalyzer(
+        forecaster=forecaster,
+        db_manager=db_manager
+    )
     
     logger.info("Creating visualizer...")
     visualizer = GARCHVisualizer()

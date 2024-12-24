@@ -22,52 +22,102 @@ class ForecastWindow:
 class GARCHForecaster:
     """Manages expanding window GARCH forecasts"""
     
-    def __init__(self, estimator, min_window: int = 1260):
-        """Initialize forecaster with GARCH estimator and minimum window size"""
+    def __init__(self, estimator: GARCHEstimator, min_window: int = 1260):
+        """Initialize forecaster with estimator and minimum window size"""
         self.estimator = estimator
         self.min_window = min_window
-
+        self.logger = logging.getLogger('garch.forecaster')
+        
+    def generate_expanding_windows(self, returns: np.ndarray, 
+                                 start_idx: int = 0) -> List[np.ndarray]:
+        """Generate expanding windows for estimation"""
+        n_obs = len(returns)
+        windows = []
+        
+        for end_idx in range(self.min_window + start_idx, n_obs + 1):
+            window = returns[start_idx:end_idx]
+            windows.append(window)
+            
+        self.logger.info(f"Generated {len(windows)} windows from {n_obs} observations")
+        return windows
+        
+    def generate_forecasts(self, window: np.ndarray, 
+                         garch_results: List[GARCHResult]) -> Dict[str, float]:
+        """Generate forecasts for each GARCH model"""
+        try:
+            forecasts = {}
+            
+            for result in garch_results:
+                model_name = f"{result.model_type}_{result.distribution}"
+                # Handle both scalar and array forecasts
+                if np.isscalar(result.forecasts_annualized):
+                    forecasts[model_name] = np.array([result.forecasts_annualized])
+                else:
+                    # Ensure array is 1D
+                    forecasts[model_name] = np.asarray(result.forecasts_annualized).ravel()
+            
+            # Calculate ensemble statistics from forecasts
+            stats = self.calculate_ensemble_stats(forecasts)
+            return stats
+            
+        except Exception as e:
+            self.logger.error(f"Error generating forecasts: {str(e)}")
+            raise
+            
+    def calculate_ensemble_stats(self, forecasts: Dict[str, np.ndarray],
+                               implied_vols: Optional[np.ndarray] = None) -> Dict[str, float]:
+        """Calculate ensemble statistics from forecasts"""
+        try:
+            # Safety check for empty forecasts
+            if not forecasts or len(forecasts) == 0:
+                return self._empty_stats()
+            
+            # Convert all forecasts to scalar values
+            processed_forecasts = {}
+            for name, forecast in forecasts.items():
+                if forecast is not None:
+                    # Convert to numpy array if needed
+                    if not isinstance(forecast, np.ndarray):
+                        forecast = np.array([forecast])
+                    # Take mean if array
+                    if len(forecast) > 0:
+                        processed_forecasts[name] = float(np.nanmean(forecast))
+            
+            if not processed_forecasts:
+                return self._empty_stats()
+            
+            # Calculate statistics from scalar values
+            values = np.array(list(processed_forecasts.values()))
+            stats = {
+                'GEV': float(np.nanmean(values)),
+                'EVOEV': float(np.nanstd(values)),
+                'DEV': float(np.nanstd(values)),  # Using std for scalar values
+                'KEV': 0.0,  # No time series for scalar values
+                'SEVTS': 0.0,  # No term structure for scalar values
+                'n_models': len(processed_forecasts)
+            }
+            
+            return stats
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating ensemble stats: {str(e)}")
+            return self._empty_stats()
+    
+    def _empty_stats(self) -> Dict[str, float]:
+        """Return empty statistics dictionary"""
+        return {
+            'GEV': np.nan,
+            'EVOEV': np.nan,
+            'DEV': np.nan,
+            'KEV': np.nan,
+            'SEVTS': np.nan,
+            'n_models': 0
+        }
+    
     def process_window(self, window: np.ndarray) -> np.ndarray:
         """Process a single window of returns data"""
         # Return the window array directly, not a dict
         return window
-
-    def generate_expanding_windows(self, returns: np.ndarray, 
-                                 checkpoint_dir: Optional[Path] = None,
-                                 start_idx: Optional[int] = None,
-                                 min_window: Optional[int] = None) -> List[np.ndarray]:
-        """Generate expanding windows for analysis"""
-        logger = logging.getLogger('garch.forecaster')
-        
-        try:
-            if min_window is None:
-                min_window = self.min_window
-                
-            if len(returns) < min_window:
-                raise ValueError(f"Insufficient data: {len(returns)} < {min_window}")
-                
-            if start_idx is None:
-                start_idx = min_window
-                
-            windows = []
-            for i in range(min_window, len(returns) + 1):
-                window = returns[max(0, i-min_window):i]
-                if len(window) >= min_window:
-                    if checkpoint_dir:
-                        checkpoint_file = checkpoint_dir / f"window_{i}.npy"
-                        if not checkpoint_file.exists():
-                            np.save(checkpoint_file, window)
-                    windows.append(window)
-                    
-            logger.info(f"Generated {len(windows)} windows from {len(returns)} observations")
-            if not windows:
-                logger.warning(f"No windows generated. Returns length: {len(returns)}, min_window: {min_window}")
-            
-            return windows
-            
-        except Exception as e:
-            logger.error(f"Error generating windows: {str(e)}")
-            raise
     
     def get_forecast_series(self, stat_name: str) -> Tuple[np.ndarray, np.ndarray]:
         """
