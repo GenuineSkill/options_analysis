@@ -286,13 +286,24 @@ class GARCHVisualizer:
             
             # Extract data
             dates = results['dates']
-            window_sizes = [r['window_size'] for r in results['results']]
-            means = [r['window_mean'] for r in results['results']]
-            stds = [r['window_std'] for r in results['results']]
-            iv_means = [r['implied_vols_mean'] for r in results['results']]
+            window_results = results['results']
+            
+            if not window_results:  # Check if results are empty
+                raise ValueError("No results to plot")
+            
+            # Extract metrics from results
+            means = [r['window_mean'] for r in window_results]
+            stds = [r['window_std'] for r in window_results]
+            iv_means = [r['implied_vols_mean'] for r in window_results]
+            
+            # Verify we have data to plot
+            if not means or not stds or not iv_means:
+                raise ValueError("Empty metrics in results")
+            
+            # Create figure
+            plt.figure(figsize=(12, 8))
             
             # Plot window statistics
-            plt.figure(figsize=(12, 8))
             plt.subplot(2, 1, 1)
             plt.plot(dates[-len(means):], means, label='Rolling Mean')
             plt.plot(dates[-len(stds):], stds, label='Rolling Std')

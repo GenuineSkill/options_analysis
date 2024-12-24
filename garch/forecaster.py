@@ -50,17 +50,19 @@ class GARCHForecaster:
                 start_idx = min_window
                 
             windows = []
-            for i in range(start_idx, len(returns)):
+            for i in range(min_window, len(returns) + 1):
                 window = returns[max(0, i-min_window):i]
                 if len(window) >= min_window:
                     if checkpoint_dir:
-                        # Save window to checkpoint if needed
                         checkpoint_file = checkpoint_dir / f"window_{i}.npy"
                         if not checkpoint_file.exists():
                             np.save(checkpoint_file, window)
                     windows.append(window)
                     
             logger.info(f"Generated {len(windows)} windows from {len(returns)} observations")
+            if not windows:
+                logger.warning(f"No windows generated. Returns length: {len(returns)}, min_window: {min_window}")
+            
             return windows
             
         except Exception as e:

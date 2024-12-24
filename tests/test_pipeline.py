@@ -70,3 +70,59 @@ def test_pipeline(sample_data, tmp_path):
     
     # Log success with details
     logger.info(f"Test passed with {len(results['results'])} windows processed") 
+
+@pytest.mark.parametrize("data_length", [
+    1260,  # Minimum required length
+    1500,  # Normal case
+    2000   # Extended dataset
+])
+def test_pipeline_with_different_lengths(data_length, tmp_path):
+    """Test pipeline with different data lengths"""
+    dates = pd.date_range('2015-01-01', freq='B', periods=data_length)
+    returns = pd.DataFrame(
+        np.random.normal(0.0001, 0.01, len(dates)),
+        index=dates,
+        columns=['returns']
+    )
+    iv = pd.DataFrame(
+        np.random.uniform(0.15, 0.25, (len(dates), 5)),
+        index=dates,
+        columns=['SPX_1M', 'SPX_2M', 'SPX_3M', 'SPX_6M', 'SPX_12M']
+    )
+    
+    components = initialize_components()
+    results = run_analysis(
+        components=components,
+        returns_df=returns,
+        iv_df=iv,
+        output_dir=tmp_path,
+        logger=logging.getLogger('test'),
+        monitor=None
+    )
+    
+    assert len(results['dates']) == data_length 
+
+def test_pipeline_insufficient_data():
+    """Test pipeline fails gracefully with insufficient data"""
+    dates = pd.date_range('2020-01-01', '2020-12-31', freq='B')
+    returns = pd.DataFrame(
+        np.random.normal(0, 0.01, len(dates)),
+        index=dates,
+        columns=['returns']
+    )
+    iv = pd.DataFrame(
+        np.random.uniform(0.15, 0.25, (len(dates), 5)),
+        index=dates,
+        columns=['SPX_1M', 'SPX_2M', 'SPX_3M', 'SPX_6M', 'SPX_12M']
+    )
+    
+    with pytest.raises(ValueError, match="Insufficient data"):
+        components = initialize_components()
+        run_analysis(
+            components=components,
+            returns_df=returns,
+            iv_df=iv,
+            output_dir=Path("temp"),
+            logger=logging.getLogger('test'),
+            monitor=None
+        ) 
