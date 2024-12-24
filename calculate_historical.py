@@ -144,52 +144,29 @@ def load_spx_data(data_path: Path, logger: logging.Logger) -> Tuple[pd.DataFrame
         # Load data
         logger.info(f"Reading data from: {data_file}")
         df = pd.read_csv(data_file)
+        logger.info(f"Total rows in CSV: {len(df)}")
+        
+        # Convert date column and set index
+        df.index = pd.to_datetime(df['Unnamed: 0'])
+        logger.info(f"Date range in CSV: {df.index[0]} to {df.index[-1]}")
+        
+        # Log columns for debugging
         logger.info(f"Columns found: {df.columns.tolist()}")
         
-        # Convert first column to datetime and set as index
-        date_col = df.columns[0]
-        df[date_col] = pd.to_datetime(df[date_col])
-        df.set_index(date_col, inplace=True)
-        
-        # Sort index to ensure chronological order
-        df.sort_index(inplace=True)
-        
-        # Process returns
+        # Process returns data
         logger.info("Processing returns data...")
-        returns = np.log(df['SPX'] / df['SPX'].shift(1)).dropna() * 100
-        returns_df = pd.DataFrame({'returns': returns})
+        returns_df = pd.DataFrame(index=df.index)
+        returns_df['returns'] = df['SPX'].pct_change()
         
-        # Process implied volatilities
+        # Process implied volatility data
         logger.info("Processing implied volatility data...")
         iv_columns = ['SPX_1M', 'SPX_2M', 'SPX_3M', 'SPX_6M', 'SPX_12M']
-        iv_df = df[iv_columns].rename(columns={
-            'SPX_1M': '1M',
-            'SPX_2M': '2M',
-            'SPX_3M': '3M',
-            'SPX_6M': '6M',
-            'SPX_12M': '12M'
-        })
+        iv_df = df[iv_columns]
         
         # Handle missing values
         if iv_df.isna().any().any():
             logger.warning("Interpolating missing IV values...")
-            iv_df = iv_df.interpolate(method='time')
-            
-        # Ensure perfect alignment between returns and IV data
-        common_dates = returns_df.index.intersection(iv_df.index)
-        returns_df = returns_df.loc[common_dates]
-        iv_df = iv_df.loc[common_dates]
-        
-        # Get all available data up to the latest date
-        latest_date = returns_df.index.max()
-        earliest_date = latest_date - pd.Timedelta(days=1000)  # Get ~3 years of data
-        
-        returns_df = returns_df[returns_df.index >= earliest_date]
-        iv_df = iv_df[iv_df.index >= earliest_date]
-        
-        # Convert to date objects after processing
-        returns_df.index = returns_df.index.date
-        iv_df.index = iv_df.index.date
+            iv_df = iv_df.interpolate(method='linear', axis=0)
         
         # Validate data
         validate_data(returns_df, iv_df)
@@ -202,79 +179,77 @@ def load_spx_data(data_path: Path, logger: logging.Logger) -> Tuple[pd.DataFrame
         logger.error(f"Traceback: {traceback.format_exc()}")
         raise
 
-def setup_analysis_components(db_path: Path, logger: logging.Logger) -> Dict:
-    """Initialize analysis components with error handling"""
-    logger.info("Initializing analysis components...")
+def initialize_components(logger: logging.Logger = None) -> Dict:
+    """Initialize all analysis components"""
+    if logger is None:
+        logger = logging.getLogger('historical_calculator')
+        
+    logger.info("Creating GARCH estimator...")
+    estimator = GARCHEstimator(
+        min_observations=1260,  # Five years as per Durham's paper
+        n_simulations=1000,
+        random_seed=42
+    )
     
-    try:
-        # Create GARCH estimator with smaller minimum window
-        logger.info("Creating GARCH estimator...")
-        estimator = GARCHEstimator(
-            min_observations=252,  # One trading year
-            n_simulations=1000,
-            random_seed=42
-        )
-        
-        # Create forecaster
-        logger.info("Creating forecaster...")
-        forecaster = GARCHForecaster(
-            estimator=estimator,
-            min_window=252  # Match the estimator's minimum observations
-        )
-        
-        # Create analyzer with db_path
-        logger.info("Creating analyzer...")
-        analyzer = ExpandingWindowAnalyzer(
-            db_path=db_path,
-            forecaster=forecaster
-        )
-        
-        # Create visualizer
-        logger.info("Creating visualizer...")
-        visualizer = GARCHVisualizer()
-        
-        return {
-            'estimator': estimator,
-            'forecaster': forecaster,
-            'analyzer': analyzer,
-            'visualizer': visualizer
-        }
-    except Exception as e:
-        logger.error(f"Error setting up components: {str(e)}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        raise
+    logger.info("Creating forecaster...")
+    forecaster = GARCHForecaster(
+        estimator=estimator,
+        min_window=1260  # Match estimator's minimum observations
+    )
+    
+    logger.info("Creating analyzer...")
+    analyzer = ExpandingWindowAnalyzer(forecaster=forecaster)
+    
+    logger.info("Creating visualizer...")
+    visualizer = GARCHVisualizer()
+    
+    return {
+        'estimator': estimator,
+        'forecaster': forecaster,
+        'analyzer': analyzer,
+        'visualizer': visualizer
+    }
 
 def run_analysis(components: Dict, returns_df: pd.DataFrame, iv_df: pd.DataFrame, 
                 output_dir: Path, logger: logging.Logger, monitor: Any) -> Dict:
-    """Run the analysis pipeline with progress monitoring"""
+    """Run the analysis pipeline with progress monitoring and checkpointing"""
     logger.info("Starting analysis pipeline...")
     
     try:
         analyzer = components['analyzer']
         visualizer = components['visualizer']
         
-        # Get all data up to the latest date
+        # Create checkpoint directory
+        checkpoint_dir = output_dir / "checkpoints"
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Using checkpoint directory: {checkpoint_dir}")
+        
+        # Get all data
         dates = returns_df.index
         returns = returns_df['returns'].values
         implied_vols = iv_df.values
         
-        # Process all available data
+        # Process expanding windows with checkpointing
         logger.info("Processing expanding windows...")
         results = analyzer.process_index(
             index_id='SPX',
             dates=dates,
             returns=returns,
-            implied_vols=implied_vols
+            implied_vols=implied_vols,
+            output_dir=output_dir  # Pass output directory for results saving
         )
         
         # Generate visualizations
         logger.info("Generating visualizations...")
+        plot_dir = output_dir / "plots"
+        plot_dir.mkdir(parents=True, exist_ok=True)
         visualizer.plot_results(
             results=results,
-            output_path=output_dir,
+            output_path=plot_dir,
             show_plots=True
         )
         
+        logger.info("Pipeline completed successfully")
         return results
         
     except Exception as e:
@@ -291,45 +266,37 @@ def cleanup(components: Dict, logger: logging.Logger):
         logger.error(f"Error during cleanup: {str(e)}")
 
 def main():
-    """Main execution function with enhanced error handling"""
-    monitor = ProgressMonitor()
-    logger = None
-    
+    """Main entry point with configuration and setup"""
     try:
-        # Setup paths
-        project_root = Path(__file__).parent
-        data_path = project_root / "data_manager/data"
-        db_path = project_root / "results/garch_results.db"
-        output_dir = project_root / "results/spx_analysis"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Initialize logging
-        logger = setup_logging(output_dir)
+        # Setup logging
+        logger = setup_logging()
         logger.info("Starting historical calculation pipeline...")
         
-        monitor.checkpoint("Initialization")
+        # Setup directories
+        root_dir = Path(__file__).parent
+        data_dir = root_dir / "data_manager" / "data"
+        output_dir = root_dir / "results"
+        output_dir.mkdir(parents=True, exist_ok=True)
         
         # Load data
-        returns_df, iv_df = load_spx_data(data_path, logger)
-        monitor.checkpoint("Data Loading")
+        returns_df, iv_df = load_spx_data(data_dir, logger)
         
         # Initialize components
-        components = setup_analysis_components(db_path, logger)
-        monitor.checkpoint("Component Setup")
+        logger.info("Initializing analysis components...")
+        components = initialize_components()
         
-        # Run analysis
+        # Configure checkpointing in forecaster
+        components['forecaster'].checkpoint_dir = output_dir / "checkpoints"
+        
+        # Run analysis with progress monitoring
+        monitor = None  # TODO: Add progress monitoring
         results = run_analysis(components, returns_df, iv_df, output_dir, logger, monitor)
         
-        # Clean up
-        cleanup(components, logger)
-        
         logger.info("Pipeline completed successfully")
-        monitor.checkpoint("Pipeline Complete")
         
     except Exception as e:
-        if logger:
-            logger.error(f"Pipeline failed: {str(e)}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
+        logger.error(f"Pipeline failed: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
         raise
         
 if __name__ == '__main__':

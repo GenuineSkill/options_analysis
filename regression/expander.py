@@ -1,9 +1,10 @@
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 from pathlib import Path
 import logging
 from datetime import datetime, date
+import pickle
 
 from data_manager.database import GARCHDatabase
 from garch.forecaster import GARCHForecaster, ForecastWindow
@@ -14,44 +15,26 @@ logger = logging.getLogger(__name__)
 class ExpandingWindowAnalyzer:
     """Manages expanding window analysis for implied volatility modeling"""
     
-    def __init__(self,
-                db_path: Union[str, Path],
-                min_window: int = 1260,
-                step_size: int = 21,
-                forecaster: Optional[GARCHForecaster] = None):
-        """
-        Initialize analyzer
-        
-        Parameters:
-        -----------
-        db_path : str or Path
-            Path to database for storing results
-        min_window : int
-            Minimum window size (default 5 years)
-        step_size : int
-            Step size for expanding windows (default 21 days)
-        forecaster : GARCHForecaster, optional
-            Pre-configured forecaster instance (creates new one if None)
-        """
-        if min_window <= 0:
-            raise ValueError("min_window must be positive")
-        if step_size <= 0:
-            raise ValueError("step_size must be positive")
-        
-        self.db = GARCHDatabase(db_path)
-        self.forecaster = forecaster or GARCHForecaster(
-            min_window=min_window,
-            step_size=step_size
-        )
-        
-    def get_last_processed_date(self, index_id: str) -> Optional[date]:
-        """Get the last processed date for an index from the database"""
-        # For now, always start from beginning
-        return None
+    def __init__(self, forecaster, db_path: Optional[Path] = None):
+        """Initialize the analyzer with a forecaster and optional database path"""
+        self.forecaster = forecaster
+        self.db_path = db_path
+
+    def save_results(self, results: Dict, output_dir: Path):
+        """Save analysis results to disk"""
+        logger = logging.getLogger('regression.expander')
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            results_file = output_dir / f"{results['index_id']}_results.pkl"
+            logger.info(f"Saving results to {results_file}")
+            with open(results_file, 'wb') as f:
+                pickle.dump(results, f)
+        except Exception as e:
+            logger.error(f"Error saving results: {str(e)}")
+            raise
 
     def process_window(self, window: np.ndarray, implied_vols: np.ndarray) -> Dict:
         """Process a single window of data"""
-        # Basic window processing
         return {
             'window_size': len(window),
             'window_mean': float(np.mean(window)),
@@ -60,13 +43,14 @@ class ExpandingWindowAnalyzer:
         }
 
     def process_index(self, index_id: str, dates: List[date], returns: np.ndarray, 
-                     implied_vols: np.ndarray) -> Dict:
+                     implied_vols: np.ndarray, output_dir: Path) -> Dict:
         """Process expanding windows for a given index"""
         logger = logging.getLogger('regression.expander')
         
         try:
             # Start from beginning of dataset
             logger.info(f"Starting new analysis for {index_id}")
+            logger.info(f"Analysis date range: {dates[0]} to {dates[-1]}")
             start_idx = 0
                 
             # Process all data
@@ -82,11 +66,17 @@ class ExpandingWindowAnalyzer:
                 result = self.process_window(window, implied_vols)
                 results.append(result)
                 
-            return {
+            # Package results
+            analysis_results = {
                 'index_id': index_id,
                 'dates': dates,
                 'results': results
             }
+            
+            # Save results before returning
+            self.save_results(analysis_results, output_dir)
+            
+            return analysis_results
             
         except Exception as e:
             logger.error(f"Error processing {index_id}: {str(e)}")
