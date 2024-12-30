@@ -6,6 +6,7 @@ import duckdb
 import pandas as pd
 import numpy as np
 from datetime import datetime
+from garch.models import ForecastWindow, GARCHResult
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +14,7 @@ class GARCHDatabase:
     def __init__(self, db_path: Union[str, Path]):
         """Initialize database connection"""
         self.db_path = Path(db_path)
+        self.logger = logging.getLogger('data_manager.database')  # Add logger
         
         # If database exists, delete it to start fresh
         if self.db_path.exists():
@@ -22,9 +24,26 @@ class GARCHDatabase:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         
         # Connect to new database
-        self.conn = duckdb.connect(str(self.db_path))
-        self._initialize_tables()
+        self.conn = None
+        self._connect()
 
+    def _connect(self):
+        """Establish database connection"""
+        try:
+            if self.conn is None:
+                self.conn = duckdb.connect(str(self.db_path))
+                self._initialize_tables()
+            else:
+                # Test connection by executing a simple query
+                try:
+                    self.conn.execute("SELECT 1").fetchone()
+                except:
+                    self.conn = duckdb.connect(str(self.db_path))
+                    self._initialize_tables()
+        except Exception as e:
+            self.logger.error(f"Database connection error: {str(e)}")
+            raise
+    
     def _initialize_tables(self):
         """Initialize database tables"""
         try:
@@ -78,9 +97,10 @@ class GARCHDatabase:
             self.logger.error(f"Error initializing database tables: {str(e)}")
             raise
 
-    def store_forecast_window(self, window, index_id: str) -> int:
-        """Store forecast window with mean forecast paths"""
+    def store_forecast_window(self, window: ForecastWindow, index_id: str):
+        """Store forecast window with automatic reconnection"""
         try:
+            self._connect()  # Ensure connection is active
             # Define horizons dictionary
             horizons = {
                 '1M': 21, '2M': 42, '3M': 63, 
@@ -140,7 +160,8 @@ class GARCHDatabase:
             return window_id
                 
         except Exception as e:
-            logger.error(f"Error storing forecast window: {str(e)}")
+            self.logger.error(f"Error storing forecast window: {str(e)}")
+            self._connect()  # Try to reconnect
             raise
 
     def get_ensemble_stats_series(self,

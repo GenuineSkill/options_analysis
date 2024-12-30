@@ -8,6 +8,7 @@ from .estimator import GARCHEstimator, GARCHResult
 import pickle
 from pathlib import Path
 from scipy import stats as scipy_stats
+from .models import ForecastWindow, GARCHResult
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,7 @@ class GARCHForecaster:
         self.n_simulations = n_simulations
         self.random_seed = random_seed
         self.checkpoint_dir = checkpoint_dir
+        self.logger = logging.getLogger('garch.forecaster')
         
         self.estimator = GARCHEstimator(
             min_observations=min_observations,
@@ -57,36 +59,64 @@ class GARCHForecaster:
         n_models = len(garch_results)
         
         try:
-            # Validate forecast paths
+            # Stack forecasts and validate
             forecast_paths = []
+            model_info = []  # Track which model produced which forecast
             for result in garch_results:
                 if result.forecast_path is None or np.isnan(result.forecast_path).any():
-                    self.logger.warning("Invalid forecast path detected")
+                    self.logger.warning(f"Invalid forecast path detected for {result.model_type}-{result.distribution}")
                     continue
-                forecast_paths.append(result.forecast_path.reshape(-1))
+                forecast_paths.append(result.forecast_path)
+                model_info.append(f"{result.model_type}-{result.distribution}")
             
             if not forecast_paths:
                 raise ValueError("No valid forecast paths available")
             
-            # Stack forecasts
-            all_forecasts = np.stack(forecast_paths)  # Shape: (n_models, 252)
+            # Stack forecasts (already in percentage terms)
+            all_forecasts = np.stack(forecast_paths)
             
             for horizon_name, tau in horizons.items():
-                # Get forecasts up to horizon τ
                 horizon_forecasts = all_forecasts[:, :tau]
                 
-                # Validate forecasts before calculations
                 if np.isnan(horizon_forecasts).any():
                     self.logger.warning(f"NaN values in forecasts for horizon {horizon_name}")
                     continue
+                
+                # Audit extreme values
+                daily_means = np.mean(horizon_forecasts, axis=0)
+                mean_vol = np.mean(daily_means)
+                
+                # If mean volatility is extreme, log detailed diagnostics
+                if mean_vol > 100 or mean_vol < 5:
+                    self.logger.warning(f"\nExtreme volatility detected for {horizon_name}:")
+                    self.logger.warning(f"Mean volatility: {mean_vol:.2f}%")
+                    self.logger.warning("\nModel-by-day forecast matrix:")
                     
-                # Calculate statistics with error checking
+                    # Create a formatted table of forecasts
+                    header = "Day |" + "|".join(f"{m:^15}" for m in model_info)
+                    self.logger.warning("-" * len(header))
+                    self.logger.warning(header)
+                    self.logger.warning("-" * len(header))
+                    
+                    for day in range(tau):
+                        row = f"{day+1:3d} |"
+                        for model in range(len(model_info)):
+                            row += f"{horizon_forecasts[model,day]:15.2f}|"
+                        self.logger.warning(row)
+                    self.logger.warning("-" * len(header))
+                    
+                    # Log model parameters
+                    self.logger.warning("\nModel parameters:")
+                    for i, result in enumerate(garch_results):
+                        self.logger.warning(f"\n{model_info[i]}:")
+                        for param, value in result.params.items():
+                            self.logger.warning(f"  {param}: {value:.6f}")
+                
                 try:
-                    daily_means = np.mean(horizon_forecasts, axis=0)
                     daily_stds = np.std(horizon_forecasts, axis=0)
                     
                     stats[horizon_name] = {
-                        'GEV': float(np.mean(daily_means)),
+                        'GEV': float(mean_vol),  # Simple mean as per Durham
                         'EVOEV': float(np.std(daily_means)),
                         'DEV': float(np.mean(daily_stds)),
                         'KEV': float(scipy_stats.skew(horizon_forecasts.flatten())),
@@ -96,7 +126,7 @@ class GARCHForecaster:
                 except Exception as e:
                     self.logger.error(f"Error calculating stats for horizon {horizon_name}: {str(e)}")
                     continue
-                    
+            
             return stats
             
         except Exception as e:
@@ -106,18 +136,31 @@ class GARCHForecaster:
     def generate_expanding_windows(self,
                                  returns: np.ndarray,
                                  dates: pd.DatetimeIndex,
-                                 min_observations: Optional[int] = None) -> List[ForecastWindow]:
+                                 forecast_horizon: int = 252) -> List[ForecastWindow]:
         """Generate expanding window forecasts"""
-        if min_observations is None:
-            min_observations = self.estimator.min_observations
-            
+        
+        if len(returns) < self.min_observations:
+            raise ValueError("Insufficient observations for estimation")
+        
+        n_windows = len(returns) - self.min_observations + 1
+        
+        # Add window size validation
+        self.logger.warning(
+            f"\nExpanding window setup:"
+            f"\n  Total observations: {len(returns)}"
+            f"\n  Min observations: {self.min_observations}"
+            f"\n  Number of windows: {n_windows}"
+            f"\n  Date range: {dates[0]} to {dates[-1]}"
+            f"\n  First window: {dates[0]} to {dates[self.min_observations-1]}"
+            f"\n  Last window: {dates[-self.min_observations]} to {dates[-1]}"
+        )
+        
         self.windows = []
-        n_windows = len(dates) - min_observations
         
         logger.info(f"Generating {n_windows} expanding windows...")
         
         for i in range(n_windows):
-            window_end = i + min_observations
+            window_end = i + self.min_observations
             window_returns = returns[i:window_end]
             
             # Estimate GARCH models
@@ -161,6 +204,73 @@ class GARCHForecaster:
                 records.append(record)
                 
         return pd.DataFrame(records)
+
+    def calculate_gev(self, forecast_paths: List[np.ndarray]) -> float:
+        """
+        Calculate Generalized Expected Volatility (GEV) from forecast paths.
+        GEV combines mean volatility forecast with higher moments to capture uncertainty.
+        """
+        try:
+            # Convert paths to numpy array and validate
+            paths = np.array(forecast_paths)
+            if len(paths) == 0:
+                self.logger.warning("Empty forecast paths")
+                return None
+            
+            # Remove any invalid values
+            if np.any(np.isnan(paths)) or np.any(np.isinf(paths)):
+                self.logger.warning("Invalid values in forecast paths, attempting to clean")
+                paths = paths[~np.isnan(paths) & ~np.isinf(paths)]
+                if len(paths) == 0:
+                    return None
+            
+            # Clip extreme values (keep within 5-150% annualized vol)
+            paths = np.clip(paths, 5, 150)
+            
+            # Calculate components with better numerical stability
+            # 1. Mean volatility (base forecast)
+            mean_vol = np.mean(paths)
+            
+            # 2. Normalized volatility of volatility (uncertainty)
+            vol_of_vol = np.std(paths) / mean_vol  # Normalize by mean
+            
+            # 3. Normalized skewness (asymmetry)
+            skew = scipy_stats.skew(paths.flatten())
+            norm_skew = np.tanh(skew / 2)  # Bound between -1 and 1
+            
+            # 4. Normalized excess kurtosis (tail risk)
+            kurt = scipy_stats.kurtosis(paths.flatten())
+            norm_kurt = np.tanh(kurt / 6)  # Bound between -1 and 1
+            
+            # Combine components with controlled scaling
+            gev = mean_vol * (
+                1.0 +  # Base volatility
+                0.2 * vol_of_vol +  # Add 0-20% for uncertainty
+                0.1 * norm_skew +   # Add ±10% for asymmetry
+                0.1 * norm_kurt     # Add ±10% for tail risk
+            )
+            
+            # Validate final result
+            if not (10 < gev < 100):
+                self.logger.warning(
+                    f"GEV outside expected range: {gev:.1f}% "
+                    f"(mean={mean_vol:.1f}%, vov={vol_of_vol:.2f}, "
+                    f"skew={norm_skew:.2f}, kurt={norm_kurt:.2f})"
+                )
+                return None
+            
+            # Log components for debugging
+            self.logger.debug(
+                f"GEV components: mean={mean_vol:.1f}%, "
+                f"vov={vol_of_vol:.2f}, skew={norm_skew:.2f}, "
+                f"kurt={norm_kurt:.2f}, final={gev:.1f}%"
+            )
+            
+            return gev
+            
+        except Exception as e:
+            self.logger.error(f"Error calculating GEV: {str(e)}")
+            return None
 
 # Example usage
 if __name__ == '__main__':

@@ -27,6 +27,7 @@ from data_manager.data_loader import DataLoader
 from data_manager.database import GARCHDatabase
 from garch.estimator import GARCHEstimator
 from garch.forecaster import GARCHForecaster
+from garch.models import ForecastWindow, GARCHResult
 
 @dataclass
 class GARCHResult:
@@ -125,6 +126,38 @@ def log_progress(index_id: str, window_count: int, total_windows: int):
     Memory usage: {psutil.Process().memory_info().rss / 1024 / 1024:.1f} MB
     """)
 
+def prepare_returns(prices: pd.Series) -> np.ndarray:
+    """
+    Prepare log returns for GARCH estimation
+    """
+    # Calculate log returns
+    returns = np.log(prices / prices.shift(1))
+    
+    # Remove any NaN/Inf values
+    returns = returns.replace([np.inf, -np.inf], np.nan)
+    returns = returns.dropna()
+    
+    # Validate returns
+    if len(returns) < 1260:  # 5 years minimum
+        raise ValueError("Insufficient data after cleaning")
+        
+    # Check for reasonable values
+    if returns.std() > 0.1:  # If std > 10%, likely not in decimal form
+        logger.warning("Converting returns to decimal form")
+        returns = returns / 100
+        
+    # Final validation
+    stats = {
+        'mean': returns.mean(),
+        'std': returns.std(),
+        'skew': returns.skew(),
+        'kurt': returns.kurtosis()
+    }
+    
+    logger.info(f"Returns statistics:\n{pd.Series(stats).to_string()}")
+    
+    return returns.values
+
 def process_index_data(index_data: pd.DataFrame, 
                       forecaster: GARCHForecaster,
                       garch_db: GARCHDatabase,
@@ -132,6 +165,9 @@ def process_index_data(index_data: pd.DataFrame,
                       dev_mode: bool = False) -> None:
     """Process a single index with optional development mode"""
     try:
+        # Prepare and validate returns
+        returns = prepare_returns(index_data['price'])
+        
         # Ensure date is datetime and set as index
         index_data['date'] = pd.to_datetime(index_data['date'])
         index_data = index_data.set_index('date')  # Set date as index

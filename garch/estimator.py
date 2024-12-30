@@ -11,6 +11,7 @@ from pathlib import Path
 import pickle
 from .checkpoint import CheckpointManager
 from datetime import datetime
+from .models import GARCHResult
 
 # Configure logging
 logging.basicConfig(
@@ -85,6 +86,39 @@ class GARCHEstimator:
         # Take first n trading days
         return trading_days.head(n).index
 
+    def _validate_forecasts(self, forecast_path: np.ndarray, 
+                           model_type: str, 
+                           distribution: str) -> bool:
+        """Validate forecast values are reasonable"""
+        try:
+            # Check for NaN or inf
+            if np.any(np.isnan(forecast_path)) or np.any(np.isinf(forecast_path)):
+                self.logger.warning(f"NaN/Inf in forecasts for {model_type}-{distribution}")
+                return False
+                
+            # Check reasonable range (8% to 100% annualized volatility)
+            if np.any(forecast_path < 8) or np.any(forecast_path > 100):
+                self.logger.warning(
+                    f"Unreasonable volatility range for {model_type}-{distribution}: "
+                    f"min={np.min(forecast_path):.1f}%, max={np.max(forecast_path):.1f}%"
+                )
+                return False
+                
+            # Check for extreme changes
+            changes = np.diff(forecast_path)
+            if np.any(np.abs(changes) > 30):
+                self.logger.warning(
+                    f"Extreme volatility changes for {model_type}-{distribution}: "
+                    f"max change={np.max(np.abs(changes)):.1f}%"
+                )
+                return False
+                
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error validating forecasts: {str(e)}")
+            return False
+
     def _estimate_single_model(self, returns: np.ndarray,
                              model_spec: tuple,
                              date: datetime,
@@ -93,64 +127,216 @@ class GARCHEstimator:
         Estimate single GARCH model and generate mean forecast path
         """
         try:
-            model_type, distribution, garch_params = model_spec
+            model_type, distribution, _ = model_spec
             
-            # Map gjrgarch to garch with o=1 for arch_model
-            arch_model_type = 'garch' if model_type == 'gjrgarch' else model_type.lower()
+            # Even tighter bounds and better starting values
+            if model_type == 'egarch':
+                bounds = {
+                    'mu': (-0.0005, 0.0005),
+                    'omega': (-1.0, -0.1),
+                    'alpha[1]': (0.05, 0.15),
+                    'beta[1]': (0.90, 0.98)
+                }
+                starting_points = [
+                    {'mu': 0, 'omega': -0.5, 'alpha[1]': 0.10, 'beta[1]': 0.94},
+                    {'mu': 0, 'omega': -0.3, 'alpha[1]': 0.08, 'beta[1]': 0.92}
+                ]
+            else:  # GARCH and GJR-GARCH
+                bounds = {
+                    'mu': (-0.0005, 0.0005),
+                    'omega': (1e-6, 2e-5),
+                    'alpha[1]': (0.03, 0.10),
+                    'beta[1]': (0.87, 0.93)
+                }
+                starting_points = [
+                    {'mu': 0, 'omega': 5e-6, 'alpha[1]': 0.05, 'beta[1]': 0.90},
+                    {'mu': 0, 'omega': 1e-5, 'alpha[1]': 0.07, 'beta[1]': 0.89}
+                ]
+                
+                if model_type == 'gjrgarch':
+                    bounds['gamma[1]'] = (0.03, 0.10)
+                    for p in starting_points:
+                        p['gamma[1]'] = 0.05
+            
+            if distribution == 'studentst':
+                bounds['nu'] = (8, 15)  # Much tighter bounds on degrees of freedom
+                for p in starting_points:
+                    p['nu'] = 10.0  # Start in middle of range
+                
+            # Try each starting point
+            best_result = None
+            best_llf = -np.inf
+            
+            for i, start_vals in enumerate(starting_points):
+                try:
+                    result = model.fit(
+                        disp='off',
+                        starting_values=start_vals,
+                        bounds=bounds,
+                        options={'maxiter': 1000}
+                    )
+                    
+                    # Only accept if parameters are valid
+                    if self._validate_garch_params(result.params):
+                        if result.loglikelihood > best_llf:
+                            best_result = result
+                            best_llf = result.loglikelihood
+                            
+                except Exception as e:
+                    self.logger.debug(f"Estimation attempt {i+1} failed: {str(e)}")
+                    continue
+                
+            if best_result is None:
+                self.logger.warning(
+                    f"Failed to estimate {model_type}-{distribution} model "
+                    f"with valid parameters"
+                )
+                return None
+            
+            # Ensure returns are in decimal form
+            if np.std(returns) > 0.1:  # If std > 10%, assume percentage
+                self.logger.warning("Converting returns from percentage to decimal")
+                returns = returns / 100
+                
+            # Log data characteristics
+            self.logger.info(
+                f"\nData summary for {model_type}-{distribution}:"
+                f"\n  Mean: {np.mean(returns):.6f}"
+                f"\n  Std:  {np.std(returns):.6f}"
+                f"\n  Skew: {scipy.stats.skew(returns):.6f}"
+                f"\n  Kurt: {scipy.stats.kurtosis(returns):.6f}"
+            )
             
             # Configure model
             model = arch_model(
                 returns,
-                vol=arch_model_type,
+                vol=model_type.lower(),
+                p=1, o=1 if model_type == 'gjrgarch' else 0, q=1,
                 dist=distribution,
-                p=garch_params.get('p', 1),
-                o=garch_params.get('o', 0),
-                q=garch_params.get('q', 1),
-                rescale=False
+                rescale=False  # Important: don't let arch_model rescale
             )
             
-            # Fit model
-            result = model.fit(disp='off', show_warning=False)
+            # Generate forecasts (in daily variance terms)
+            forecasts = best_result.forecast(horizon=252)
+            daily_vol = np.sqrt(forecasts.variance.values[-1, :])
             
-            # Get next 252 trading days
-            forecast_dates = self._get_next_n_trading_days(date, index_id)
-            n_forecast_days = len(forecast_dates)
-            
-            # Generate and average forecast paths
-            forecast_path = np.zeros(n_forecast_days)
-            for _ in range(self.n_simulations):
-                sim = result.forecast(
-                    horizon=n_forecast_days,
-                    method='simulation',
-                    simulations=1,
-                    reindex=False
-                )
-                forecast_path += np.sqrt(sim.variance.values.flatten()) * np.sqrt(252)
-            
-            forecast_path /= self.n_simulations
+            # Convert to annualized volatility only at the end
+            annual_vol = daily_vol * np.sqrt(252) * 100
             
             return GARCHResult(
                 model_type=model_type,
                 distribution=distribution,
-                params=result.params.to_dict(),
-                forecast_path=forecast_path,
-                volatility_path=result.conditional_volatility * np.sqrt(252)
+                params=best_result.params.to_dict(),
+                forecast_path=annual_vol,
+                volatility_path=best_result.conditional_volatility * np.sqrt(252) * 100
             )
             
         except Exception as e:
-            self.logger.warning(
-                f"Failed to estimate {model_type}-{distribution}: {str(e)}"
-            )
+            self.logger.error(f"Error in {model_type}-{distribution}: {str(e)}")
             return None
 
+    def _validate_garch_params(self, params: pd.Series) -> bool:
+        """Validate GARCH parameters are reasonable"""
+        try:
+            # Check mean
+            if abs(params.get('mu', 0)) > 0.001:
+                self.logger.warning(f"Mean too large: {params['mu']:.6f}")
+                return False
+            
+            # Check omega
+            if not (1e-6 <= params.get('omega', 0) <= 1e-4):
+                self.logger.warning(f"Omega outside bounds: {params['omega']:.6f}")
+                return False
+            
+            # Check ARCH effect
+            if not (0.01 <= params.get('alpha[1]', 0) <= 0.15):
+                self.logger.warning(f"Alpha outside bounds: {params['alpha[1]']:.6f}")
+                return False
+            
+            # Check GARCH persistence
+            if not (0.80 <= params.get('beta[1]', 0) <= 0.95):
+                self.logger.warning(f"Beta outside bounds: {params['beta[1]']:.6f}")
+                return False
+            
+            # Check leverage effect if present
+            if 'gamma[1]' in params and not (0 <= params['gamma[1]'] <= 0.15):
+                self.logger.warning(f"Gamma outside bounds: {params['gamma[1]']:.6f}")
+                return False
+            
+            # Check degrees of freedom if present
+            if 'nu' in params and not (4.1 <= params['nu'] <= 30):
+                self.logger.warning(f"Nu outside bounds: {params['nu']:.6f}")
+                return False
+            
+            # Check total persistence
+            persistence = params.get('alpha[1]', 0) + params.get('beta[1]', 0)
+            if 'gamma[1]' in params:
+                persistence += 0.5 * params['gamma[1]']
+            
+            if not (0.95 <= persistence <= 0.999):
+                self.logger.warning(f"Invalid persistence: {persistence:.3f}")
+                return False
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error validating parameters: {str(e)}")
+            return False
+
     def estimate_models(self, returns: np.ndarray,
-                       date: Optional[pd.Timestamp] = None) -> List[GARCHResult]:
-        """Estimate all GARCH models with checkpointing"""
+                       date: Optional[pd.Timestamp] = None,
+                       index_id: str = None) -> List[GARCHResult]:
+        """
+        Estimate all GARCH models with checkpointing
+        """
         if len(returns) < self.min_observations:
             raise ValueError(
                 f"Insufficient observations: {len(returns)} < {self.min_observations}"
             )
             
+        # Add detailed window size diagnostics
+        window_years = len(returns) / 252  # Approximate years of data
+        self.logger.warning(
+            f"\nWindow diagnostics for {date}:"
+            f"\n  Window size: {len(returns)} observations"
+            f"\n  Approx years: {window_years:.1f}"
+            f"\n  Start date: {date - pd.Timedelta(days=len(returns))} "
+            f"\n  End date: {date}"
+        )
+        
+        # Input validation and diagnostics
+        returns = np.array(returns, dtype=np.float64)
+        returns_stats = {
+            'mean': np.mean(returns),
+            'std': np.std(returns),
+            'min': np.min(returns),
+            'max': np.max(returns),
+            'abs_max': np.max(np.abs(returns))
+        }
+        
+        self.logger.info(
+            f"Input returns stats for {date}:\n"
+            f"  Mean: {returns_stats['mean']:.6f}\n"
+            f"  Std:  {returns_stats['std']:.6f}\n"
+            f"  Min:  {returns_stats['min']:.6f}\n"
+            f"  Max:  {returns_stats['max']:.6f}\n"
+            f"  |Max|: {returns_stats['abs_max']:.6f}"
+        )
+        
+        # Pre-validate returns
+        if returns_stats['abs_max'] > 1:
+            self.logger.info("Pre-scaling returns (percentage to decimal)")
+            returns = returns / 100
+            
+        # Verify scaling
+        if np.max(np.abs(returns)) > 0.5:
+            self.logger.error(f"Returns too large after scaling: max={np.max(np.abs(returns)):.2f}")
+            return []
+            
+        if np.std(returns) < 0.0001 or np.std(returns) > 0.1:
+            self.logger.error(f"Returns volatility outside reasonable range: std={np.std(returns):.6f}")
+            return []
+        
         try:
             # Try to load from checkpoint
             if self.checkpoint_manager and date:
@@ -165,10 +351,10 @@ class GARCHEstimator:
                 for model_spec in self.model_specs:
                     future = executor.submit(
                         self._estimate_single_model,
-                        returns,
+                        returns.copy(),  # Pass a copy to each worker
                         model_spec,
                         date,
-                        'index'
+                        index_id or 'SPX'
                     )
                     futures.append(future)
                 
@@ -178,6 +364,17 @@ class GARCHEstimator:
                     result = future.result()
                     if result is not None:
                         results.append(result)
+            
+            # Log estimation results
+            if results:
+                forecasts = [r.forecast_path for r in results]
+                self.logger.info(
+                    f"Model estimation summary for {date}:\n"
+                    f"  Models estimated: {len(results)}\n"
+                    f"  Mean forecast: {np.mean(forecasts):.1f}%\n"
+                    f"  Std forecast: {np.std(forecasts):.1f}%\n"
+                    f"  Range: [{np.min(forecasts):.1f}%, {np.max(forecasts):.1f}%]"
+                )
             
             # Save checkpoint if we have valid results
             if self.checkpoint_manager and date and results:
