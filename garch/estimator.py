@@ -10,6 +10,7 @@ import logging
 from pathlib import Path
 import pickle
 from .checkpoint import CheckpointManager
+from datetime import datetime
 
 # Configure logging
 logging.basicConfig(
@@ -18,181 +19,197 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Set logging level for checkpoint-related messages
-checkpoint_logger = logging.getLogger('garch.estimator')
-checkpoint_logger.setLevel(logging.INFO)  # Change to logging.DEBUG to see all checkpoint messages
-
-# Suppress known warnings from arch package
-warnings.filterwarnings('ignore', category=RuntimeWarning, message='invalid value encountered in sqrt')
-
 @dataclass
 class GARCHResult:
     """Container for GARCH estimation results"""
     model_type: str
     distribution: str
     params: Dict[str, float]
-    forecasts_annualized: np.ndarray  # Store annualized volatility forecasts
-    volatility_annualized: np.ndarray  # Store annualized historical volatilities
+    forecast_path: np.ndarray  # Store mean forecast path
+    volatility_path: np.ndarray  # Store historical volatilities
 
 class GARCHEstimator:
     """Estimates and manages ensemble of GARCH models"""
     
-    def __init__(self, checkpoint_dir: Optional[Path] = None):
-        self.logger = logging.getLogger('garch.estimator')
+    def __init__(self, min_observations: int = 1260,
+                 n_simulations: int = 1000,
+                 random_seed: Optional[int] = None,
+                 checkpoint_dir: Optional[Path] = None):
+        """
+        Initialize estimator
+        
+        Args:
+            min_observations: Minimum number of observations for estimation
+            n_simulations: Number of Monte Carlo simulations
+            random_seed: Random seed for reproducibility
+            checkpoint_dir: Directory for checkpointing results
+        """
+        self.min_observations = min_observations
+        self.n_simulations = n_simulations
+        self.random_seed = random_seed
+        
+        # Load holiday calendar
+        holiday_file = Path(__file__).parent.parent / "data_manager/data/market_holidays_1987_2027.csv"
+        self.holiday_calendar = pd.read_csv(holiday_file)
+        self.holiday_calendar['date'] = pd.to_datetime(self.holiday_calendar['date'])
+        
+        # Define model specifications with GJR-GARCH
+        self.model_specs = [
+            ('garch', 'normal', {'p': 1, 'o': 0, 'q': 1}),
+            ('garch', 'studentst', {'p': 1, 'o': 0, 'q': 1}),
+            ('egarch', 'normal', {'p': 1, 'q': 1}),
+            ('egarch', 'studentst', {'p': 1, 'q': 1}),
+            # GJR-GARCH implemented as GARCH with o=1
+            ('gjrgarch', 'normal', {'p': 1, 'o': 1, 'q': 1}),
+            ('gjrgarch', 'studentst', {'p': 1, 'o': 1, 'q': 1})
+        ]
+        
         self.checkpoint_manager = None
         if checkpoint_dir:
             self.checkpoint_manager = CheckpointManager(checkpoint_dir)
             
-        # Define model specifications
-        self.model_specs = [
-            ('GARCH', 'normal'),
-            ('GARCH', 'studentst'),
-            ('EGARCH', 'normal'),
-            ('EGARCH', 'studentst'),
-            ('GJR-GARCH', 'normal'),
-            ('GJR-GARCH', 'studentst')
-        ]
+        self.logger = logging.getLogger('garch.estimator')
+
+    def _get_next_n_trading_days(self, start_date: datetime, index_id: str, n: int = 252) -> pd.DatetimeIndex:
+        """Get the next n trading days from start_date for given index"""
+        holiday_col = f'{index_id}_holiday'
         
-        self.min_observations = 252  # Minimum one year of data
-            
-    def _annualize_variance(self, daily_variance: np.ndarray) -> np.ndarray:
-        """Convert daily variance to annualized volatility"""
-        return np.sqrt(252 * daily_variance) * 100  # Convert to percentage
+        # Get future dates from calendar
+        future_dates = self.holiday_calendar[
+            (self.holiday_calendar['date'] > start_date)
+        ].copy()
         
-    def _estimate_single_model(self, 
-                             returns: np.ndarray,
-                             model_type: str,
-                             distribution: str,
-                             forecast_horizon: int = 252,
-                             n_simulations: int = 1000) -> Optional[GARCHResult]:
+        # Filter out holidays for this index
+        trading_days = future_dates[future_dates[holiday_col] == 0]['date']
+        
+        # Take first n trading days
+        return trading_days.head(n).index
+
+    def _estimate_single_model(self, returns: np.ndarray,
+                             model_spec: tuple,
+                             date: datetime,
+                             index_id: str) -> Optional[GARCHResult]:
         """
-        Estimate single GARCH model and generate forecasts
+        Estimate single GARCH model and generate mean forecast path
         """
         try:
-            # Convert returns to percentage
-            returns_pct = returns * 100
+            model_type, distribution, garch_params = model_spec
+            
+            # Map gjrgarch to garch with o=1 for arch_model
+            arch_model_type = 'garch' if model_type == 'gjrgarch' else model_type.lower()
             
             # Configure model
-            if model_type == 'GARCH':
-                model = arch_model(returns_pct, vol='Garch', p=1, q=1, dist=distribution, rescale=False)
-            elif model_type == 'EGARCH':
-                model = arch_model(returns_pct, vol='EGARCH', p=1, q=1, dist=distribution, rescale=False)
-            elif model_type == 'GJR-GARCH':
-                model = arch_model(returns_pct, vol='GARCH', p=1, o=1, q=1, dist=distribution, rescale=False)
-            else:
-                raise ValueError(f"Unknown model type: {model_type}")
-                
+            model = arch_model(
+                returns,
+                vol=arch_model_type,
+                dist=distribution,
+                p=garch_params.get('p', 1),
+                o=garch_params.get('o', 0),
+                q=garch_params.get('q', 1),
+                rescale=False
+            )
+            
             # Fit model
             result = model.fit(disp='off', show_warning=False)
             
-            # Generate forecasts - use simulation for all models to ensure consistency
-            forecasts = result.forecast(horizon=forecast_horizon, method='simulation', 
-                                     simulations=n_simulations)
+            # Get next 252 trading days
+            forecast_dates = self._get_next_n_trading_days(date, index_id)
+            n_forecast_days = len(forecast_dates)
             
-            # Get mean variance across simulations
-            forecast_variance = forecasts.variance.mean(axis=1).values[-forecast_horizon:]
+            # Generate and average forecast paths
+            forecast_path = np.zeros(n_forecast_days)
+            for _ in range(self.n_simulations):
+                sim = result.forecast(
+                    horizon=n_forecast_days,
+                    method='simulation',
+                    simulations=1,
+                    reindex=False
+                )
+                forecast_path += np.sqrt(sim.variance.values.flatten()) * np.sqrt(252)
             
-            # Convert to annualized volatility (scalar, not array)
-            forecast_volatility = np.sqrt(forecast_variance)
-            forecast_volatility_annualized = float(forecast_volatility.mean() * np.sqrt(252))
-            historical_volatility_annualized = float(np.sqrt(result.conditional_volatility[-1]) * np.sqrt(252))
+            forecast_path /= self.n_simulations
             
             return GARCHResult(
                 model_type=model_type,
                 distribution=distribution,
-                params=dict(result.params),
-                forecasts_annualized=forecast_volatility_annualized,  # Now a scalar
-                volatility_annualized=historical_volatility_annualized  # Now a scalar
+                params=result.params.to_dict(),
+                forecast_path=forecast_path,
+                volatility_path=result.conditional_volatility * np.sqrt(252)
             )
-                
+            
         except Exception as e:
-            self.logger.warning(f"Error estimating {model_type}-{distribution}: {str(e)}")
+            self.logger.warning(
+                f"Failed to estimate {model_type}-{distribution}: {str(e)}"
+            )
             return None
-            
-    def estimate(self, returns: np.ndarray, date: pd.Timestamp) -> List[GARCHResult]:
+
+    def estimate_models(self, returns: np.ndarray,
+                       date: Optional[pd.Timestamp] = None) -> List[GARCHResult]:
         """Estimate all GARCH models with checkpointing"""
-        try:
-            # Initialize counters for progress tracking
-            total_models = len(self.model_specs)
-            loaded_from_checkpoint = 0
-            estimated_new = 0
+        if len(returns) < self.min_observations:
+            raise ValueError(
+                f"Insufficient observations: {len(returns)} < {self.min_observations}"
+            )
             
-            # Try to load from checkpoint first
-            if self.checkpoint_manager:
+        try:
+            # Try to load from checkpoint
+            if self.checkpoint_manager and date:
                 checkpoint = self.checkpoint_manager.load_checkpoint(date)
                 if checkpoint and self._validate_checkpoint(checkpoint):
-                    self.logger.debug(f"Loaded valid checkpoint for {date}")
-                    loaded_from_checkpoint = len(checkpoint)
+                    self.logger.debug(f"Using checkpoint for {date}")
                     return checkpoint
             
-            # Estimate all models
-            results = []
-            for i, (model_type, distribution) in enumerate(self.model_specs, 1):
-                try:
-                    result = self._estimate_single_model(
-                        returns=returns,
-                        model_type=model_type,
-                        distribution=distribution
+            # Estimate all models in parallel
+            with ProcessPoolExecutor() as executor:
+                futures = []
+                for model_spec in self.model_specs:
+                    future = executor.submit(
+                        self._estimate_single_model,
+                        returns,
+                        model_spec,
+                        date,
+                        'index'
                     )
+                    futures.append(future)
+                
+                # Collect results
+                results = []
+                for future in futures:
+                    result = future.result()
                     if result is not None:
                         results.append(result)
-                        estimated_new += 1
-                        
-                    # Show progress every 2 models or when complete
-                    if i % 2 == 0 or i == total_models:
-                        progress_msg = (
-                            f"Progress for {date:%Y-%m-%d}: "
-                            f"{i}/{total_models} models processed "
-                            f"({estimated_new} estimated, {loaded_from_checkpoint} from checkpoint)"
-                        )
-                        self.logger.info(progress_msg)
-                        
-                except Exception as e:
-                    self.logger.warning(
-                        f"Failed to estimate {model_type}-{distribution} for {date:%Y-%m-%d}: {str(e)}"
-                    )
-                    continue
             
-            # Only save checkpoint if we got valid results
-            if self.checkpoint_manager and results and self._validate_checkpoint(results):
+            # Save checkpoint if we have valid results
+            if self.checkpoint_manager and date and results:
                 self.checkpoint_manager.save_checkpoint(date, results)
-                self.logger.debug(f"Saved checkpoint for {date}")
-            
-            # Final progress update
-            final_msg = (
-                f"Completed {date:%Y-%m-%d}: "
-                f"{len(results)}/{total_models} models successful "
-                f"({estimated_new} estimated, {loaded_from_checkpoint} from checkpoint)"
-            )
-            self.logger.info(final_msg)
-            
+                
             return results
             
         except Exception as e:
-            self.logger.error(f"Error estimating GARCH models for {date:%Y-%m-%d}: {str(e)}")
+            self.logger.error(f"Error estimating models: {str(e)}")
             raise
 
     def _validate_checkpoint(self, results: List[GARCHResult]) -> bool:
-        """Validate checkpoint data"""
+        """Validate checkpoint results"""
         try:
-            if not results or len(results) == 0:
+            if not results:
                 return False
                 
             for result in results:
                 # Check if result has all required attributes
                 if not all(hasattr(result, attr) for attr in 
                           ['model_type', 'distribution', 'params', 
-                           'forecasts_annualized', 'volatility_annualized']):
+                           'forecast_path', 'volatility_path']):
                     return False
                     
                 # Check if forecasts are valid
-                if (not isinstance(result.forecasts_annualized, np.ndarray) or 
-                    len(result.forecasts_annualized) == 0):
+                if (not isinstance(result.forecast_path, np.ndarray) or 
+                    len(result.forecast_path) == 0):
                     return False
                     
                 # Check if volatilities are valid
-                if (not isinstance(result.volatility_annualized, np.ndarray) or 
-                    len(result.volatility_annualized) == 0):
+                if (not isinstance(result.volatility_path, np.ndarray) or 
+                    len(result.volatility_path) == 0):
                     return False
                     
             return True

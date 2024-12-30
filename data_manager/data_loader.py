@@ -16,6 +16,11 @@ class DataLoader:
         self.db_path = db_path
         self.conn = duckdb.connect(db_path)
         self.validator = DataValidator()
+        
+        # Load holiday calendar
+        holiday_file = Path(__file__).parent / "data/market_holidays_1987_2027.csv"
+        self.holiday_calendar = pd.read_csv(holiday_file)
+        self.holiday_calendar['date'] = pd.to_datetime(self.holiday_calendar['date'])
         self._initialize_database()
 
     def _initialize_database(self):
@@ -29,6 +34,8 @@ class DataLoader:
                 rf_rate DECIMAL,
                 div_yield DECIMAL,
                 is_holiday BOOLEAN,
+                is_ntrade BOOLEAN,
+                returns DECIMAL,
                 PRIMARY KEY (date, index_id)
             )
         """)
@@ -45,49 +52,44 @@ class DataLoader:
         """)
 
     def load_and_clean_data(self, file_path: str) -> Dict[str, pd.DataFrame]:
-        """
-        Load and clean data from CSV file with validation.
-        
-        Args:
-            file_path: Path to data file
-        Returns:
-            Dict with cleaned DataFrames for daily_data and implied_vols
-        """
+        """Load and clean data from CSV file with validation."""
         print("\nLoading and validating data...")
         
         # Read the CSV file
         df = pd.read_csv(file_path)
-        
-        # Convert date column
         df['date'] = pd.to_datetime(df['Unnamed: 0'])
         df = df.drop('Unnamed: 0', axis=1)
         
-        # Validate the data
-        is_valid, issues, holiday_dict = self.validator.validate_market_data(df)
+        # Merge with holiday calendar
+        df = pd.merge(df, self.holiday_calendar, on='date', how='left')
         
-        # Report any validation issues
-        if not is_valid:
-            print("\nValidation Issues Found:")
-            print("-" * 50)
-            for issue in issues:
-                print(f"- {issue}")
-            print("\nProceeding with data loading despite issues...")
-        
-        # Create daily data DataFrame
+        # Create daily data DataFrame with holiday handling
         daily_data = []
         for index in ['SPX', 'SX5E', 'UKX']:
+            holiday_col = f'{index}_holiday'
+            ntrade_col = f'{index}_NTRADE'
+            
             index_data = pd.DataFrame({
                 'date': df['date'],
                 'index_id': index,
                 'price': df[index],
                 'rf_rate': df[f'{index}_RF'],
                 'div_yield': df[f'{index}_DY'],
-                'is_holiday': holiday_dict[f'{index}_holiday']
+                'is_holiday': df[holiday_col],
+                'is_ntrade': df[ntrade_col]  # Keep NTRADE as is for later analysis
             })
+            
+            # Calculate returns
+            index_data['returns'] = index_data['price'].pct_change()
+            
+            # Set returns to 0 on holidays
+            index_data.loc[index_data['is_holiday'] == 1, 'returns'] = 0.0
+            
             daily_data.append(index_data)
+            
         daily_df = pd.concat(daily_data, ignore_index=True)
         
-        # Create implied volatility DataFrame
+        # Create implied volatility DataFrame (include all days)
         iv_data = []
         tenors = ['1M', '2M', '3M', '6M', '12M']
         for index in ['SPX', 'SX5E', 'UKX']:
@@ -101,19 +103,18 @@ class DataLoader:
                         'iv': df[col_name]
                     })
                     iv_data.append(tenor_data)
+                    
         iv_df = pd.concat(iv_data, ignore_index=True)
         
         # Print data quality summary
-        self._print_data_quality_summary(daily_df, iv_df, holiday_dict)
+        self._print_data_quality_summary(daily_df, iv_df)
         
         return {
             'daily_data': daily_df,
             'implied_vols': iv_df
         }
 
-    def _print_data_quality_summary(self, daily_df: pd.DataFrame, 
-                                  iv_df: pd.DataFrame, 
-                                  holiday_dict: Dict[str, pd.Series]):
+    def _print_data_quality_summary(self, daily_df: pd.DataFrame, iv_df: pd.DataFrame):
         """Print summary of data quality metrics."""
         print("\nData Quality Summary:")
         print("-" * 50)
@@ -123,16 +124,18 @@ class DataLoader:
         print(f"Total rows: {len(daily_df):,}")
         print(f"Date range: {daily_df['date'].min()} to {daily_df['date'].max()}")
         
-        # Holiday summary by market
-        print("\nHoliday Summary:")
+        # Trading day summary by market
+        print("\nTrading Day Summary:")
         for market in ['SPX', 'SX5E', 'UKX']:
-            holidays = holiday_dict[f'{market}_holiday']
-            holiday_count = holidays.sum()
-            holiday_pct = (holiday_count / len(holidays)) * 100
-            print(f"{market}: {holiday_count:,} holidays ({holiday_pct:.1f}%)")
-        
-        # IV data summary
-        print("\nImplied Volatility Data:")
+            market_data = daily_df[daily_df['index_id'] == market]
+            total_days = len(market_data)
+            ntrade_days = market_data['is_ntrade'].sum()
+            print(f"{market}:")
+            print(f"  Trading days: {total_days:,}")
+            print(f"  NTRADE days: {ntrade_days:,} ({ntrade_days/total_days*100:.1f}%)")
+            
+        # IV data summary with trading day alignment
+        print("\nImplied Volatility Data (Trading Days Only):")
         print(f"Total rows: {len(iv_df):,}")
         
         # IV coverage by market and tenor
@@ -160,7 +163,9 @@ class DataLoader:
                     price, 
                     rf_rate, 
                     div_yield, 
-                    is_holiday
+                    is_holiday,
+                    is_ntrade,
+                    returns
                 FROM daily_data_df
             """)
 
