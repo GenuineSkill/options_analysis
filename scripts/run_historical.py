@@ -158,111 +158,82 @@ def prepare_returns(prices: pd.Series) -> np.ndarray:
     
     return returns.values
 
-def process_index_data(index_data: pd.DataFrame, 
-                      forecaster: GARCHForecaster,
+def process_index_data(index_data: pd.DataFrame,
+                      estimator: GARCHEstimator,
                       garch_db: GARCHDatabase,
                       index_id: str,
-                      dev_mode: bool = False) -> None:
-    """Process a single index with optional development mode"""
-    try:
-        # Prepare and validate returns
-        returns = prepare_returns(index_data['price'])
-        
-        # Ensure date is datetime and set as index
-        index_data['date'] = pd.to_datetime(index_data['date'])
-        index_data = index_data.set_index('date')  # Set date as index
-        
-        # Clean and prepare returns data
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            returns = index_data['price'].pct_change()
-        
-        returns = returns.ffill()  # Forward fill small gaps
-        returns = returns.dropna()  # Remove any remaining NAs
-        
-        if len(returns) < forecaster.min_observations:
-            logger.warning(f"Insufficient data for {index_id} after cleaning")
-            return
+                      dev_mode: bool = True):
+    """Process historical data for an index"""
+    
+    # Data parameters
+    if dev_mode:
+        TRAIN_YEARS = 12  # ~3000 observations minimum
+        TEST_YEARS = 2
+    else:
+        TRAIN_YEARS = 12
+        TEST_YEARS = 20
+
+    # Convert years to days
+    MIN_TRAIN_DAYS = int(TRAIN_YEARS * 252)  # Minimum ~3024 trading days
+    TEST_DAYS = int(TEST_YEARS * 252)
+    
+    # Create expanding windows
+    windows = garch_db.create_expanding_windows(
+        data=index_data,
+        min_train_size=MIN_TRAIN_DAYS,
+        test_size=TEST_DAYS,
+        step_size=21  # Monthly steps
+    )
+    
+    logger.info(f"""
+    Starting analysis for {index_id}:
+    Data range: {index_data.index[0]} to {index_data.index[-1]}
+    Total observations: {len(index_data)}
+    """)
+    
+    logger.info(f"""
+    Created {len(windows)} expanding windows:
+    First window: {windows[0][0].index[0]} to {windows[0][1].index[-1]}
+    Last window: {windows[-1][0].index[0]} to {windows[-1][1].index[-1]}
+    """)
+    
+    # Process each window
+    for i, (train_data, test_data) in enumerate(windows):
+        try:
+            logger.info(f"Processing window {i+1}/{len(windows)}")
+            logger.info(f"Train period: {train_data.index[0]} to {train_data.index[-1]}")
+            logger.info(f"Test period: {test_data.index[0]} to {test_data.index[-1]}")
             
-        # In dev mode, limit to 5 years training + 2 years testing
-        if dev_mode:
-            min_idx = forecaster.min_observations  # About 5 years
-            max_idx = min_idx + (252 * 2)  # Add 2 years for testing
-            max_idx = min(max_idx, len(returns))
-            logger.info(f"Development mode: Processing years {returns.index[min_idx].year} to {returns.index[max_idx-1].year}")
-        else:
-            max_idx = len(returns)
-        
-        # Set up progress monitoring
-        n_windows = max_idx - forecaster.min_observations
-        monitor = ProgressMonitor(
-            total=n_windows,
-            desc=f"Processing {index_id} windows",
-            logger=logger
-        )
-        
-        # Run analysis
-        logger.info(f"Starting GARCH estimation for {index_id}...")
-        
-        for i in range(forecaster.min_observations, max_idx):
-            try:
-                window = returns.iloc[:i]
-                date = window.index[-1]
-                
-                results = forecaster.estimator.estimate_models(
-                    returns=window.values,
-                    date=date,
-                    index_id=index_id
-                )
-                
-                if not results:
-                    logger.warning(f"No valid models for {index_id} at {date}")
-                    continue
-                
-                # Log model counts
-                model_counts = {}
-                for result in results:
-                    key = f"{result.model_type}-{result.distribution}"
-                    model_counts[key] = model_counts.get(key, 0) + 1
-                logger.info(f"Models estimated for {date}: {model_counts}")
-                
-                if len(results) >= 3:
-                    stats = forecaster.calculate_ensemble_stats(results)
-                    if not stats:
-                        logger.warning(f"Failed to calculate stats for {index_id} at {date}")
-                        continue
-                        
-                    # Log statistics
-                    for horizon, horizon_stats in stats.items():
-                        logger.info(f"Stats for {date} {horizon}: {horizon_stats}")
-                        
-                    garch_db.store_forecast_window(
-                        window=ForecastWindow(
-                            start_date=window.index[0],
-                            end_date=date,
-                            returns=window.values,
-                            garch_results=results,
-                            ensemble_stats=stats
-                        ),
-                        index_id=index_id
-                    )
-                
-                monitor.update()
-                
-                # Periodic validation and cleanup
-                if i % 100 == 0:
-                    gc.collect()
-                    log_memory_usage()
-                    if not validate_results(garch_db):
-                        raise ValueError("Invalid results detected")
-                        
-            except Exception as e:
-                logger.error(f"Error processing {index_id} window {i}: {str(e)}")
-                continue
-                
-    except Exception as e:
-        logger.error(f"Failed to process {index_id}: {str(e)}")
-        raise
+            # Prepare returns data
+            returns = prepare_returns(train_data['price'])
+            
+            # Estimate models - pass returns, end date, and index_id
+            garch_results = estimator.estimate_models(
+                returns=returns,
+                date=train_data.index[-1],
+                index_id=index_id
+            )
+            
+            # Calculate ensemble statistics for 1-month horizon
+            ensemble_stats = estimator.calculate_ensemble_stats(
+                garch_results,
+                tau=21  # 1-month horizon
+            )
+            
+            # Store results
+            window = ForecastWindow(
+                start_date=train_data.index[0],
+                end_date=train_data.index[-1],
+                returns=returns,
+                garch_results=garch_results,
+                ensemble_stats=ensemble_stats
+            )
+            
+            garch_db.store_forecast_window(window, index_id)
+            
+        except Exception as e:
+            logger.error(f"Error processing window {i+1}: {str(e)}")
+            continue
 
 if __name__ == "__main__":
     # Register cleanup handlers
@@ -297,15 +268,27 @@ if __name__ == "__main__":
         
         # Initialize GARCH components
         logger.info("Initializing GARCH components...")
-        forecaster = GARCHForecaster(
-            min_observations=1260,  # About 5 years of daily data
+        estimator = GARCHEstimator(
+            min_observations=3000,
             n_simulations=1000,
             random_seed=42,
             checkpoint_dir=checkpoint_path
         )
         
-        # Add development mode flag
+        # Development mode settings
         DEV_MODE = True  # Set to False for full historical calculation
+        
+        # Data parameters
+        if DEV_MODE:
+            TRAIN_YEARS = 12  # Increased from 5 to get 3000 observations
+            TEST_YEARS = 2    # Keep 2 years of testing
+        else:
+            TRAIN_YEARS = 12  # Also update this for production
+            TEST_YEARS = 20   # Full historical test period
+        
+        # Convert years to days
+        TRAIN_DAYS = int(TRAIN_YEARS * 252)  # Approximately 3024 trading days
+        TEST_DAYS = int(TEST_YEARS * 252)
         
         # Process each index
         for index_id in ['SPX']:
@@ -320,7 +303,7 @@ if __name__ == "__main__":
             # Process index with development mode
             process_index_data(
                 index_data=index_data,
-                forecaster=forecaster,
+                estimator=estimator,
                 garch_db=garch_db,
                 index_id=index_id,
                 dev_mode=DEV_MODE

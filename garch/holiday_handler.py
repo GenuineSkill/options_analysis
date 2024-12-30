@@ -11,7 +11,7 @@ class HolidayHandler:
     def __init__(self):
         """Initialize holiday handler with market calendar"""
         # Load holiday calendar
-        holiday_file = Path(__file__).parent / "data/market_holidays_1987_2027.csv"
+        holiday_file = Path(__file__).parent.parent / "data_manager/data/market_holidays_1987_2027.csv"
         self.calendar = pd.read_csv(holiday_file)
         self.calendar['date'] = pd.to_datetime(self.calendar['date'])
         
@@ -50,4 +50,4 @@ class HolidayHandler:
             (self.calendar[holiday_col] == 0)
         ]['date']
         
-        return pd.DatetimeIndex(trading_days)
+        return pd.DatetimeIndex(trading_days) 

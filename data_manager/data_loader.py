@@ -185,3 +185,11 @@ class DataLoader:
     def close(self):
         """Close database connection."""
         self.conn.close()
+
+    def validate_data(self, data: pd.DataFrame) -> bool:
+        """Validate minimum data requirements"""
+        min_obs = 3000  # Update from 1260
+        
+        if len(data) < min_obs:
+            self.logger.error(f"Insufficient observations: {len(data)} < {min_obs}")
+            return False

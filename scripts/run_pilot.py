@@ -11,6 +11,16 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 from calculate_historical import load_spx_data, initialize_components, run_analysis
 from utils.progress import ProgressMonitor
+from garch.garch_forecaster import GARCHForecaster
+
+# Data parameters
+TRAIN_YEARS = 12  # Update from 5 to 12 years
+TRAIN_DAYS = int(TRAIN_YEARS * 252)  # ~3024 days
+
+forecaster = GARCHForecaster(
+    min_observations=3000,  # Update from 1260
+    n_simulations=1000
+)
 
 if __name__ == "__main__":
     # Configure logging

@@ -11,7 +11,9 @@ from pathlib import Path
 import pickle
 from .checkpoint import CheckpointManager
 from datetime import datetime
-from .models import GARCHResult
+from .models import GARCHResult, ForecastWindow
+from .holiday_handler import HolidayHandler
+from data_manager.database import GARCHDatabase
 
 # Configure logging
 logging.basicConfig(
@@ -32,43 +34,42 @@ class GARCHResult:
 class GARCHEstimator:
     """Estimates and manages ensemble of GARCH models"""
     
-    def __init__(self, min_observations: int = 1260,
+    def __init__(self, min_observations: int = 3000,
                  n_simulations: int = 1000,
-                 random_seed: Optional[int] = None,
-                 checkpoint_dir: Optional[Path] = None):
+                 random_seed: int = 42,
+                 checkpoint_dir: str = None):
         """
         Initialize estimator
         
         Args:
-            min_observations: Minimum number of observations for estimation
+            min_observations: Minimum number of daily returns required (12 years)
             n_simulations: Number of Monte Carlo simulations
             random_seed: Random seed for reproducibility
-            checkpoint_dir: Directory for checkpointing results
+            checkpoint_dir: Directory to store checkpoints
         """
         self.min_observations = min_observations
         self.n_simulations = n_simulations
         self.random_seed = random_seed
+        self.checkpoint_dir = checkpoint_dir
         
-        # Load holiday calendar
-        holiday_file = Path(__file__).parent.parent / "data_manager/data/market_holidays_1987_2027.csv"
+        # Initialize holiday handler
+        self.holiday_handler = HolidayHandler()
+        
+        # Load holiday calendar from absolute path
+        holiday_file = Path(r"C:\Users\w.sterling\volatility\options_analysis\data_manager\data\market_holidays_1987_2027.csv")
         self.holiday_calendar = pd.read_csv(holiday_file)
         self.holiday_calendar['date'] = pd.to_datetime(self.holiday_calendar['date'])
         
-        # Define model specifications with GJR-GARCH
+        # Define model specifications
         self.model_specs = [
-            ('garch', 'normal', {'p': 1, 'o': 0, 'q': 1}),
-            ('garch', 'studentst', {'p': 1, 'o': 0, 'q': 1}),
-            ('egarch', 'normal', {'p': 1, 'q': 1}),
-            ('egarch', 'studentst', {'p': 1, 'q': 1}),
-            # GJR-GARCH implemented as GARCH with o=1
-            ('gjrgarch', 'normal', {'p': 1, 'o': 1, 'q': 1}),
-            ('gjrgarch', 'studentst', {'p': 1, 'o': 1, 'q': 1})
+            ('garch', 'normal', 1),
+            ('garch', 'studentst', 1),
+            ('egarch', 'normal', 1),
+            ('egarch', 'studentst', 1),
+            ('gjrgarch', 'normal', 1),
+            ('gjrgarch', 'studentst', 1)
         ]
         
-        self.checkpoint_manager = None
-        if checkpoint_dir:
-            self.checkpoint_manager = CheckpointManager(checkpoint_dir)
-            
         self.logger = logging.getLogger('garch.estimator')
 
     def _get_next_n_trading_days(self, start_date: datetime, index_id: str, n: int = 252) -> pd.DatetimeIndex:
@@ -86,30 +87,27 @@ class GARCHEstimator:
         # Take first n trading days
         return trading_days.head(n).index
 
-    def _validate_forecasts(self, forecast_path: np.ndarray, 
-                           model_type: str, 
-                           distribution: str) -> bool:
+    def _validate_forecasts(self, forecasts: np.ndarray) -> bool:
         """Validate forecast values are reasonable"""
         try:
             # Check for NaN or inf
-            if np.any(np.isnan(forecast_path)) or np.any(np.isinf(forecast_path)):
-                self.logger.warning(f"NaN/Inf in forecasts for {model_type}-{distribution}")
+            if np.any(np.isnan(forecasts)) or np.any(np.isinf(forecasts)):
+                self.logger.warning(f"Found NaN/inf in forecasts")
                 return False
                 
-            # Check reasonable range (8% to 100% annualized volatility)
-            if np.any(forecast_path < 8) or np.any(forecast_path > 100):
+            # Check reasonable range (5% to 100% annualized)
+            if np.any(forecasts < 5) or np.any(forecasts > 100):
                 self.logger.warning(
-                    f"Unreasonable volatility range for {model_type}-{distribution}: "
-                    f"min={np.min(forecast_path):.1f}%, max={np.max(forecast_path):.1f}%"
+                    f"Forecasts outside range [5%, 100%]: min={np.min(forecasts):.1f}%, "
+                    f"max={np.max(forecasts):.1f}%"
                 )
                 return False
                 
-            # Check for extreme changes
-            changes = np.diff(forecast_path)
-            if np.any(np.abs(changes) > 30):
+            # Check for explosive behavior
+            changes = np.diff(forecasts)
+            if np.any(np.abs(changes) > 10):  # Max 10% daily change
                 self.logger.warning(
-                    f"Extreme volatility changes for {model_type}-{distribution}: "
-                    f"max change={np.max(np.abs(changes)):.1f}%"
+                    f"Large daily changes detected: max change = {np.max(np.abs(changes)):.1f}%"
                 )
                 return False
                 
@@ -123,158 +121,147 @@ class GARCHEstimator:
                              model_spec: tuple,
                              date: datetime,
                              index_id: str) -> Optional[GARCHResult]:
-        """
-        Estimate single GARCH model and generate mean forecast path
-        """
+        """Estimate a single GARCH model specification"""
         try:
-            model_type, distribution, _ = model_spec
+            model_type, distribution, p = model_spec
             
-            # Even tighter bounds and better starting values
-            if model_type == 'egarch':
-                bounds = {
-                    'mu': (-0.0005, 0.0005),
-                    'omega': (-1.0, -0.1),
-                    'alpha[1]': (0.05, 0.15),
-                    'beta[1]': (0.90, 0.98)
-                }
-                starting_points = [
-                    {'mu': 0, 'omega': -0.5, 'alpha[1]': 0.10, 'beta[1]': 0.94},
-                    {'mu': 0, 'omega': -0.3, 'alpha[1]': 0.08, 'beta[1]': 0.92}
-                ]
-            else:  # GARCH and GJR-GARCH
-                bounds = {
-                    'mu': (-0.0005, 0.0005),
-                    'omega': (1e-6, 2e-5),
-                    'alpha[1]': (0.03, 0.10),
-                    'beta[1]': (0.87, 0.93)
-                }
-                starting_points = [
-                    {'mu': 0, 'omega': 5e-6, 'alpha[1]': 0.05, 'beta[1]': 0.90},
-                    {'mu': 0, 'omega': 1e-5, 'alpha[1]': 0.07, 'beta[1]': 0.89}
-                ]
-                
-                if model_type == 'gjrgarch':
-                    bounds['gamma[1]'] = (0.03, 0.10)
-                    for p in starting_points:
-                        p['gamma[1]'] = 0.05
+            # Initialize random state
+            random_state = np.random.RandomState(self.random_seed)
             
-            if distribution == 'studentst':
-                bounds['nu'] = (8, 15)  # Much tighter bounds on degrees of freedom
-                for p in starting_points:
-                    p['nu'] = 10.0  # Start in middle of range
-                
-            # Try each starting point
-            best_result = None
-            best_llf = -np.inf
+            # Scale returns to percentage form for estimation
+            returns_std = np.std(returns)
+            self.logger.info(f"Input returns std: {returns_std:.6f}")
+            returns = returns * 100  # Convert decimal returns to percentage
             
-            for i, start_vals in enumerate(starting_points):
-                try:
-                    result = model.fit(
-                        disp='off',
-                        starting_values=start_vals,
-                        bounds=bounds,
-                        options={'maxiter': 1000}
-                    )
-                    
-                    # Only accept if parameters are valid
-                    if self._validate_garch_params(result.params):
-                        if result.loglikelihood > best_llf:
-                            best_result = result
-                            best_llf = result.loglikelihood
-                            
-                except Exception as e:
-                    self.logger.debug(f"Estimation attempt {i+1} failed: {str(e)}")
-                    continue
-                
-            if best_result is None:
-                self.logger.warning(
-                    f"Failed to estimate {model_type}-{distribution} model "
-                    f"with valid parameters"
-                )
-                return None
-            
-            # Ensure returns are in decimal form
-            if np.std(returns) > 0.1:  # If std > 10%, assume percentage
-                self.logger.warning("Converting returns from percentage to decimal")
-                returns = returns / 100
-                
-            # Log data characteristics
-            self.logger.info(
-                f"\nData summary for {model_type}-{distribution}:"
-                f"\n  Mean: {np.mean(returns):.6f}"
-                f"\n  Std:  {np.std(returns):.6f}"
-                f"\n  Skew: {scipy.stats.skew(returns):.6f}"
-                f"\n  Kurt: {scipy.stats.kurtosis(returns):.6f}"
-            )
-            
-            # Configure model
+            # Initialize model with correct parameters
+            vol_model = 'garch' if model_type == 'gjrgarch' else model_type
             model = arch_model(
                 returns,
-                vol=model_type.lower(),
-                p=1, o=1 if model_type == 'gjrgarch' else 0, q=1,
+                mean='constant',
+                vol=vol_model,
+                p=1,  # Fixed p=1 for all models
+                o=1 if model_type == 'gjrgarch' else 0,  # Leverage term for GJR-GARCH
+                q=1,  # Fixed q=1 for all models
                 dist=distribution,
-                rescale=False  # Important: don't let arch_model rescale
+                rescale=True  # Enable rescaling for numerical stability
             )
             
-            # Generate forecasts (in daily variance terms)
-            forecasts = best_result.forecast(horizon=252)
-            daily_vol = np.sqrt(forecasts.variance.values[-1, :])
+            # Fit model
+            result = model.fit(
+                disp='off',
+                show_warning=False,
+                options={'maxiter': 1000},
+                update_freq=0
+            )
             
-            # Convert to annualized volatility only at the end
-            annual_vol = daily_vol * np.sqrt(252) * 100
+            # Generate forecasts based on model type
+            if model_type == 'egarch':
+                # Generate multiple paths for EGARCH using simulation
+                variance_paths = np.zeros((252, self.n_simulations))
+                
+                for sim in range(self.n_simulations):
+                    forecast = result.forecast(
+                        horizon=252,
+                        method='simulation',
+                        simulations=1,
+                        random_state=random_state,
+                        reindex=False
+                    )
+                    # Extract variance path - shape is (T, horizon, 1)
+                    var_path = forecast.variance.values
+                    if len(var_path.shape) == 3:
+                        var_path = var_path[-1, :, 0]  # Take last observation, first simulation
+                    else:
+                        var_path = var_path[-1, :]  # Take last observation
+                    variance_paths[:, sim] = var_path
+                    
+                self.logger.info(f"EGARCH paths shape: {variance_paths.shape}")
+            else:
+                # Use analytic + noise for other models
+                base_forecast = result.forecast(
+                    horizon=252,
+                    method='analytic',
+                    reindex=False
+                )
+                base_variance = base_forecast.variance.values[-1]
+                
+                # Generate multiple paths with reduced noise
+                variance_paths = np.zeros((252, self.n_simulations))
+                for i in range(self.n_simulations):
+                    noise = 1 + random_state.normal(0, 0.02, size=252)  # Reduced noise
+                    variance_paths[:, i] = base_variance * noise
+            
+            self.logger.info(f"Generated variance paths shape: {variance_paths.shape}")
+            
+            # Compute mean path using median across simulations
+            mean_var_path = np.median(variance_paths, axis=1)
+            
+            # Convert to annualized volatility percentage
+            daily_vol = np.sqrt(mean_var_path)  # Convert variance to volatility
+            annual_vol = daily_vol * np.sqrt(252)  # Annualize
+            
+            # Log forecast statistics
+            self.logger.info(
+                f"Raw forecast stats for {model_type}-{distribution}:\n"
+                f"  Daily vol (mean): {np.mean(daily_vol):.6f}\n"
+                f"  Annual vol (mean): {np.mean(annual_vol):.6f}"
+            )
+            
+            # Log final forecast statistics
+            self.logger.info(
+                f"Final forecast stats for {model_type}-{distribution} (percentage):\n"
+                f"  Mean: {np.mean(annual_vol):.1f}%\n"
+                f"  Std:  {np.std(annual_vol):.1f}%\n"
+                f"  Min:  {np.min(annual_vol):.1f}%\n"
+                f"  Max:  {np.max(annual_vol):.1f}%"
+            )
+            
+            # Validate forecast path
+            if not self._validate_forecast_path(annual_vol):
+                return None
             
             return GARCHResult(
                 model_type=model_type,
                 distribution=distribution,
-                params=best_result.params.to_dict(),
+                params=dict(result.params),
                 forecast_path=annual_vol,
-                volatility_path=best_result.conditional_volatility * np.sqrt(252) * 100
+                volatility_path=np.sqrt(result.conditional_volatility) * np.sqrt(252)
             )
             
         except Exception as e:
             self.logger.error(f"Error in {model_type}-{distribution}: {str(e)}")
             return None
 
-    def _validate_garch_params(self, params: pd.Series) -> bool:
+    def _validate_garch_params(self, params: dict, model_type: str) -> bool:
         """Validate GARCH parameters are reasonable"""
         try:
-            # Check mean
-            if abs(params.get('mu', 0)) > 0.001:
-                self.logger.warning(f"Mean too large: {params['mu']:.6f}")
-                return False
+            # Basic parameter bounds - adjusted for typical ranges
+            param_bounds = {
+                'omega': (1e-7, 0.05),  # Increased upper bound significantly
+                'alpha[1]': (0.01, 0.2),
+                'beta[1]': (0.7, 0.99),
+                'gamma[1]': (0.01, 0.2)  # For GJR-GARCH
+            }
             
-            # Check omega
-            if not (1e-6 <= params.get('omega', 0) <= 1e-4):
-                self.logger.warning(f"Omega outside bounds: {params['omega']:.6f}")
-                return False
+            # Check each parameter
+            for param, (min_val, max_val) in param_bounds.items():
+                if param in params:
+                    value = params[param]
+                    if not (min_val <= value <= max_val):
+                        self.logger.warning(
+                            f"Parameter {param}={value:.6f} outside bounds "
+                            f"[{min_val}, {max_val}]"
+                        )
+                        return False
             
-            # Check ARCH effect
-            if not (0.01 <= params.get('alpha[1]', 0) <= 0.15):
-                self.logger.warning(f"Alpha outside bounds: {params['alpha[1]']:.6f}")
-                return False
-            
-            # Check GARCH persistence
-            if not (0.80 <= params.get('beta[1]', 0) <= 0.95):
-                self.logger.warning(f"Beta outside bounds: {params['beta[1]']:.6f}")
-                return False
-            
-            # Check leverage effect if present
-            if 'gamma[1]' in params and not (0 <= params['gamma[1]'] <= 0.15):
-                self.logger.warning(f"Gamma outside bounds: {params['gamma[1]']:.6f}")
-                return False
-            
-            # Check degrees of freedom if present
-            if 'nu' in params and not (4.1 <= params['nu'] <= 30):
-                self.logger.warning(f"Nu outside bounds: {params['nu']:.6f}")
-                return False
-            
-            # Check total persistence
-            persistence = params.get('alpha[1]', 0) + params.get('beta[1]', 0)
-            if 'gamma[1]' in params:
-                persistence += 0.5 * params['gamma[1]']
+            # Check persistence
+            alpha = params.get('alpha[1]', 0)
+            beta = params.get('beta[1]', 0)
+            gamma = params.get('gamma[1]', 0)
+            persistence = alpha + beta + (gamma/2 if model_type == 'gjrgarch' else 0)
             
             if not (0.95 <= persistence <= 0.999):
-                self.logger.warning(f"Invalid persistence: {persistence:.3f}")
+                self.logger.warning(f"Invalid persistence {persistence:.3f}")
                 return False
             
             return True
@@ -283,103 +270,143 @@ class GARCHEstimator:
             self.logger.error(f"Error validating parameters: {str(e)}")
             return False
 
-    def estimate_models(self, returns: np.ndarray,
-                       date: Optional[pd.Timestamp] = None,
-                       index_id: str = None) -> List[GARCHResult]:
-        """
-        Estimate all GARCH models with checkpointing
-        """
-        if len(returns) < self.min_observations:
-            raise ValueError(
-                f"Insufficient observations: {len(returns)} < {self.min_observations}"
-            )
+    def _validate_forecast_path(self, path: np.ndarray) -> bool:
+        """Validate entire forecast path"""
+        try:
+            # No zeros or negatives
+            if np.any(path <= 0):
+                self.logger.warning("Found non-positive values in forecast path")
+                return False
             
-        # Add detailed window size diagnostics
-        window_years = len(returns) / 252  # Approximate years of data
-        self.logger.warning(
-            f"\nWindow diagnostics for {date}:"
-            f"\n  Window size: {len(returns)} observations"
-            f"\n  Approx years: {window_years:.1f}"
-            f"\n  Start date: {date - pd.Timedelta(days=len(returns))} "
-            f"\n  End date: {date}"
-        )
+            # Check reasonable range (5% to 100% annualized)
+            if np.any(path < 5) or np.any(path > 100):
+                self.logger.warning(
+                    f"Forecast outside range [5%, 100%]: min={np.min(path):.1f}%, "
+                    f"max={np.max(path):.1f}%"
+                )
+                return False
+            
+            # Check for monotonicity violations
+            # Volatility shouldn't change by more than 50% between days
+            changes = np.abs(np.diff(path) / path[:-1])
+            if np.any(changes > 0.50):
+                self.logger.warning(
+                    f"Large daily changes detected: max change = {np.max(changes):.1f}%"
+                )
+                return False
+            
+            # Long-term mean reversion - relaxed constraint
+            if abs(path[-1] - path[0]) / path[0] > 1.0:  # Allow up to 100% change
+                self.logger.warning(
+                    f"Excessive long-term drift: start={path[0]:.1f}%, end={path[-1]:.1f}%"
+                )
+                return False
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error validating forecast path: {str(e)}")
+            return False
+
+    def _prepare_returns(self, returns: np.ndarray, dates: pd.DatetimeIndex, index_id: str) -> np.ndarray:
+        """Convert returns to daily log returns if needed and verify trading days"""
+        # Verify dates are trading days
+        holiday_col = f'{index_id}_holiday'
+        holidays = self.holiday_calendar[self.holiday_calendar[holiday_col] == 1]['date']
+        if any(date in holidays for date in dates):
+            raise ValueError("Input returns contain holidays")
         
-        # Input validation and diagnostics
-        returns = np.array(returns, dtype=np.float64)
-        returns_stats = {
-            'mean': np.mean(returns),
-            'std': np.std(returns),
-            'min': np.min(returns),
-            'max': np.max(returns),
-            'abs_max': np.max(np.abs(returns))
-        }
-        
-        self.logger.info(
-            f"Input returns stats for {date}:\n"
-            f"  Mean: {returns_stats['mean']:.6f}\n"
-            f"  Std:  {returns_stats['std']:.6f}\n"
-            f"  Min:  {returns_stats['min']:.6f}\n"
-            f"  Max:  {returns_stats['max']:.6f}\n"
-            f"  |Max|: {returns_stats['abs_max']:.6f}"
-        )
-        
-        # Pre-validate returns
-        if returns_stats['abs_max'] > 1:
-            self.logger.info("Pre-scaling returns (percentage to decimal)")
+        # If returns look like percentages (std > 0.1)
+        if np.std(returns) > 0.1:
+            self.logger.info("Converting percentage returns to decimal")
             returns = returns / 100
             
-        # Verify scaling
-        if np.max(np.abs(returns)) > 0.5:
-            self.logger.error(f"Returns too large after scaling: max={np.max(np.abs(returns)):.2f}")
-            return []
+        # Verify reasonable range for daily returns
+        returns_std = np.std(returns)
+        if not (0.005 <= returns_std <= 0.03):
+            raise ValueError(f"Returns volatility outside daily range: std={returns_std:.6f}")
             
-        if np.std(returns) < 0.0001 or np.std(returns) > 0.1:
-            self.logger.error(f"Returns volatility outside reasonable range: std={np.std(returns):.6f}")
-            return []
+        # Convert to log returns if not already
+        if np.min(returns) < -1:  # Simple returns have lower bound of -1
+            raise ValueError("Returns appear to be incorrectly scaled")
+            
+        log_returns = np.log1p(returns)
         
+        self.logger.info(
+            f"Prepared log returns:\n"
+            f"  Mean: {np.mean(log_returns):.6f}\n"
+            f"  Std:  {np.std(log_returns):.6f}"
+        )
+        
+        return log_returns
+
+    def estimate_models(self, returns: np.ndarray, date: datetime, index_id: str) -> List[GARCHResult]:
+        """Estimate all GARCH model specifications"""
         try:
-            # Try to load from checkpoint
-            if self.checkpoint_manager and date:
-                checkpoint = self.checkpoint_manager.load_checkpoint(date)
-                if checkpoint and self._validate_checkpoint(checkpoint):
-                    self.logger.debug(f"Using checkpoint for {date}")
-                    return checkpoint
+            # Get actual dates accounting for trading days
+            days_of_returns = len(returns)
+            trading_days = pd.date_range(
+                start=pd.Timestamp('1987-01-02'),  # First price date
+                end=pd.Timestamp(date),
+                freq='B'  # Business days
+            )
             
-            # Estimate all models in parallel
-            with ProcessPoolExecutor() as executor:
-                futures = []
-                for model_spec in self.model_specs:
-                    future = executor.submit(
-                        self._estimate_single_model,
-                        returns.copy(),  # Pass a copy to each worker
-                        model_spec,
-                        date,
-                        index_id or 'SPX'
+            # Filter out holidays for this index
+            holiday_col = f'{index_id}_holiday'
+            holidays = self.holiday_calendar[self.holiday_calendar[holiday_col] == 1]['date']
+            trading_days = [
+                day for day in trading_days 
+                if day not in holidays
+            ]
+            
+            price_start_date = trading_days[0]
+            return_start_date = trading_days[1]  # First return requires two prices
+            
+            # Log window diagnostics
+            self.logger.warning(f"""
+Window diagnostics for {date}:
+  Returns: {days_of_returns} observations
+  Price window: {price_start_date.strftime('%Y-%m-%d')} to {pd.Timestamp(date).strftime('%Y-%m-%d')}
+  Return window: {return_start_date.strftime('%Y-%m-%d')} to {pd.Timestamp(date).strftime('%Y-%m-%d')}
+  Approx years: {days_of_returns/252:.1f}
+  Trading days per year: {len(trading_days)/((trading_days[-1] - trading_days[0]).days/365.25):.1f}
+""")
+            
+            # Log input data statistics
+            self.logger.info(f"Input returns stats for {date}:")
+            stats = {
+                'Mean': returns.mean(),
+                'Std': returns.std(),
+                'Min': returns.min(),
+                'Max': returns.max(),
+                '|Max|': max(abs(returns.min()), abs(returns.max())),
+                'First date': return_start_date.strftime('%Y-%m-%d'),
+                'Last date': pd.Timestamp(date).strftime('%Y-%m-%d')
+            }
+            for name, value in stats.items():
+                if isinstance(value, str):
+                    self.logger.info(f"  {name}: {value}")
+                else:
+                    self.logger.info(f"  {name}: {value:8.6f}")
+            
+            results = []
+            for model_spec in self.model_specs:
+                try:
+                    result = self._estimate_single_model(
+                        returns=returns,
+                        model_spec=model_spec,
+                        date=date,
+                        index_id=index_id
                     )
-                    futures.append(future)
-                
-                # Collect results
-                results = []
-                for future in futures:
-                    result = future.result()
                     if result is not None:
                         results.append(result)
-            
-            # Log estimation results
-            if results:
-                forecasts = [r.forecast_path for r in results]
-                self.logger.info(
-                    f"Model estimation summary for {date}:\n"
-                    f"  Models estimated: {len(results)}\n"
-                    f"  Mean forecast: {np.mean(forecasts):.1f}%\n"
-                    f"  Std forecast: {np.std(forecasts):.1f}%\n"
-                    f"  Range: [{np.min(forecasts):.1f}%, {np.max(forecasts):.1f}%]"
-                )
-            
-            # Save checkpoint if we have valid results
-            if self.checkpoint_manager and date and results:
-                self.checkpoint_manager.save_checkpoint(date, results)
+                except Exception as e:
+                    self.logger.error(f"Error estimating {model_spec}: {str(e)}")
+                    continue
                 
+            if not results:
+                raise ValueError("No valid models estimated")
+            
             return results
             
         except Exception as e:
@@ -415,6 +442,168 @@ class GARCHEstimator:
             self.logger.warning(f"Error validating checkpoint: {str(e)}")
             return False
 
+    def _convert_to_annualized_vol(self, daily_variance: np.ndarray) -> np.ndarray:
+        """Convert daily variance to annualized volatility percentage"""
+        # Use actual number of trading days (~252) for annualization
+        trading_days_per_year = len(self.holiday_calendar[
+            self.holiday_calendar[f'SPX_holiday'] == 0
+        ]) / ((self.holiday_calendar['date'].max() - 
+               self.holiday_calendar['date'].min()).days / 365.25)
+        
+        # Convert variance to volatility
+        daily_vol = np.sqrt(daily_variance)
+        
+        # Annualize using actual trading days and convert to percentage
+        annual_vol_pct = daily_vol * np.sqrt(trading_days_per_year) * 100
+        
+        return annual_vol_pct
+
+    def _validate_input_data(self, returns: np.ndarray, dates: pd.DatetimeIndex, index_id: str) -> bool:
+        """Validate input data meets requirements"""
+        try:
+            # Check dates are within valid range
+            if not all(self.holiday_handler.validate_date(date) for date in [dates[0], dates[-1]]):
+                self.logger.error(
+                    f"Dates outside valid range: {dates[0]:%Y-%m-%d} to {dates[-1]:%Y-%m-%d}"
+                )
+                return False
+            
+            # Verify dates are trading days
+            if not all(self.holiday_handler.is_trading_day(date, index_id) for date in dates):
+                self.logger.error("Input returns contain holidays")
+                return False
+            
+            # Check for sufficient observations
+            if len(returns) < self.min_observations:
+                self.logger.error(f"Insufficient observations: {len(returns)} < {self.min_observations}")
+                return False
+            
+            # Check for missing values
+            if np.any(np.isnan(returns)):
+                self.logger.error("Input returns contain missing values")
+                return False
+            
+            # Verify reasonable range for daily returns
+            returns_std = np.std(returns)
+            if not (0.005 <= returns_std <= 0.03):
+                self.logger.error(f"Returns volatility outside daily range: std={returns_std:.6f}")
+                return False
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error validating input data: {str(e)}")
+            return False
+
+    def _get_starting_values(self, model_type: str, distribution: str) -> dict:
+        """Get reasonable starting values for optimization"""
+        base_values = {
+            'mu': 0.0,
+            'omega': 5e-6,
+            'alpha[1]': 0.08,
+            'beta[1]': 0.90
+        }
+        
+        if model_type == 'gjrgarch':
+            base_values['gamma[1]'] = 0.05
+        
+        if distribution == 'studentst':
+            base_values['nu'] = 8.0
+        
+        return base_values
+
+    def calculate_ensemble_stats(self, garch_results: List[GARCHResult], tau: int = 21) -> Dict[str, Dict[str, float]]:
+        """Calculate ensemble statistics from GARCH model forecasts
+        
+        Args:
+            garch_results: List of GARCH model results
+            tau: Forecast horizon in trading days
+            
+        Returns:
+            Dictionary with horizon keys (e.g., 'T21') containing dictionaries of statistics
+        """
+        if not garch_results:
+            raise ValueError("No valid GARCH results provided")
+        
+        J = len(garch_results)  # Number of models
+        
+        # Extract forecast paths up to tau for all models
+        forecasts = np.array([result.forecast_path[:tau] for result in garch_results])  # Shape: (J, tau)
+        
+        # Calculate ensemble statistics
+        mean_forecast = np.mean(forecasts, axis=0)  # Average across models for each time point
+        gev = np.mean(forecasts)  # Overall mean
+        evoev = np.sqrt(np.mean((mean_forecast - gev) ** 2))
+        dev = np.mean([np.std(forecasts[:, t], ddof=1) for t in range(tau)])
+        kev = np.mean([stats.skew(forecasts[:, t]) for t in range(tau)])
+        slopes = (forecasts[:, -1] - forecasts[:, 0]) / tau
+        sevts = np.mean(slopes)
+        
+        # Log detailed statistics
+        self.logger.info(
+            f"\nDetailed ensemble statistics (tau={tau}):\n"
+            f"Cross-sectional statistics by time point:\n"
+            f"  Mean forecast: {mean_forecast}\n"
+            f"  Std devs: {[np.std(forecasts[:, t], ddof=1) for t in range(tau)]}\n"
+            f"  Skewness: {[stats.skew(forecasts[:, t]) for t in range(tau)]}\n"
+            f"Model-specific slopes:\n"
+            f"  {slopes}\n"
+            f"GEV calculation:\n"
+            f"  Total sum: {np.sum(forecasts)}\n"
+            f"  J * tau: {J * tau}\n"
+            f"  Final GEV: {gev:.2f}"
+        )
+        
+        # Store results by horizon
+        ensemble_stats = {
+            f'T{tau}': {
+                'gev': float(gev),
+                'evoev': float(evoev),
+                'dev': float(dev),
+                'kev': float(kev),
+                'sevts': float(sevts)
+            }
+        }
+        
+        self.logger.info(
+            f"\nEnsemble statistics (tau={tau}):\n"
+            f"  GEV:   {gev:.1f}%  (Mean expected volatility)\n"
+            f"  EVOEV: {evoev:.1f}%  (Std dev of mean forecast deviations)\n"
+            f"  DEV:   {dev:.1f}%  (Mean cross-sectional std dev)\n"
+            f"  KEV:   {kev:.2f}  (Mean cross-sectional skewness)\n"
+            f"  SEVTS: {sevts:.2f}%/day  (Mean term structure slope)"
+        )
+        
+        return ensemble_stats
+
+    def calculate_ensemble_stats_multi(self, garch_results: List[GARCHResult], 
+                                     horizons: List[int] = None) -> Dict[int, Dict[str, float]]:
+        """Calculate ensemble statistics for multiple forecast horizons
+        
+        Args:
+            garch_results: List of GARCH model results
+            horizons: List of forecast horizons in trading days. If None, uses standard
+                     option expiries [21, 42, 63, 126, 252] (1M, 2M, 3M, 6M, 12M)
+                     
+        Returns:
+            Dictionary mapping horizon -> ensemble statistics
+        """
+        if horizons is None:
+            horizons = [21, 42, 63, 126, 252]  # Standard option expiries
+        
+        # Validate horizons
+        max_horizon = max(horizons)
+        if max_horizon > 252:
+            raise ValueError(f"Maximum horizon {max_horizon} exceeds 252 trading days")
+        
+        # Calculate stats for each horizon
+        horizon_stats = {}
+        for tau in horizons:
+            self.logger.info(f"\nCalculating ensemble statistics for {tau}-day horizon:")
+            horizon_stats[tau] = self.calculate_ensemble_stats(garch_results, tau)
+        
+        return horizon_stats
+
 # Example usage
 if __name__ == '__main__':
     # Example data preparation
@@ -422,7 +611,7 @@ if __name__ == '__main__':
     
     # Initialize estimator
     estimator = GARCHEstimator(
-        min_observations=1260,
+        min_observations=3000,
         n_simulations=1000,
         random_seed=42
     )
@@ -430,8 +619,12 @@ if __name__ == '__main__':
     # Estimate models
     results = estimator.estimate_models(returns, forecast_horizon=252)
     
-    # Calculate ensemble statistics for 1-month horizon
-    stats = estimator.calculate_ensemble_stats(results, tau=21)
-    print("Ensemble statistics (annualized volatility %):")
-    for stat, value in stats.items():
-        print(f"{stat}: {value:.2f}%")
+    # Calculate ensemble statistics for standard option expiries
+    horizon_stats = estimator.calculate_ensemble_stats_multi(results)
+    
+    # Print results
+    print("\nEnsemble statistics by horizon (annualized volatility %):")
+    for tau, stats in horizon_stats.items():
+        print(f"\n{tau}-day horizon:")
+        for stat, value in stats.items():
+            print(f"  {stat}: {value:.2f}%")

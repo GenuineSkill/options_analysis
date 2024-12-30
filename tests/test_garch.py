@@ -10,6 +10,7 @@ import pytest
 import numpy as np
 from garch.estimator import GARCHEstimator, GARCHResult
 from scipy import stats
+from datetime import datetime
 
 @pytest.fixture
 def sample_returns():
@@ -123,6 +124,28 @@ def test_simulation_stability(estimator, sample_returns):
     # Check stability across runs
     variation = np.std(all_forecasts, axis=0) / np.mean(all_forecasts, axis=0)
     assert np.all(variation < 0.1)  # Coefficient of variation < 10%
+
+def test_garch_estimation():
+    # Generate test data
+    n_obs = 3024  # Update from 1260 to match new requirement
+    returns = np.random.normal(0, 0.01, n_obs)
+    
+    estimator = GARCHEstimator(min_observations=3000)
+    # ... rest of test
+
+def test_gjr_garch_estimation():
+    """Test GJR-GARCH model estimation and forecasting"""
+    returns = np.random.normal(0, 0.01, 1000)  # Simulated returns
+    
+    estimator = GARCHEstimator()
+    model_spec = ('gjrgarch', 'normal', {'p': 1, 'o': 1, 'q': 1})
+    
+    result = estimator._estimate_single_model(returns, model_spec, datetime.now(), 'SPX')
+    
+    assert result is not None
+    assert result.model_type == 'gjrgarch'
+    assert 10 <= np.mean(result.forecast_path) <= 40  # Reasonable vol range
+    assert len(np.unique(result.forecast_path)) > 1  # Forecasts vary over time
 
 if __name__ == '__main__':
     pytest.main([__file__])

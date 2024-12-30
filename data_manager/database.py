@@ -1,31 +1,67 @@
 import logging
 from pathlib import Path
-from typing import Union, Optional, Dict, List
+from typing import Union, Optional, Dict, List, Tuple
 import json
 import duckdb
 import pandas as pd
 import numpy as np
 from datetime import datetime
-from garch.models import ForecastWindow, GARCHResult
+from models import ForecastWindow, GARCHResult
+import os
 
 logger = logging.getLogger(__name__)
 
 class GARCHDatabase:
-    def __init__(self, db_path: Union[str, Path]):
+    def __init__(self, db_path: str):
         """Initialize database connection"""
-        self.db_path = Path(db_path)
-        self.logger = logging.getLogger('data_manager.database')  # Add logger
+        self.logger = logging.getLogger(__name__)
+        self.db_path = db_path
         
-        # If database exists, delete it to start fresh
-        if self.db_path.exists():
-            self.db_path.unlink()
+        # Create database directory if it doesn't exist
+        db_dir = os.path.dirname(db_path)
+        if not os.path.exists(db_dir):
+            os.makedirs(db_dir)
         
-        # Create parent directory if it doesn't exist
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        # Initialize connection
+        self.conn = duckdb.connect(db_path)
         
-        # Connect to new database
-        self.conn = None
-        self._connect()
+        # Create tables if they don't exist
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS forecast_windows (
+                window_id INTEGER PRIMARY KEY,
+                index_id VARCHAR,
+                start_date TIMESTAMP,
+                end_date TIMESTAMP,
+                returns BLOB
+            );
+            
+            CREATE TABLE IF NOT EXISTS garch_results (
+                result_id INTEGER PRIMARY KEY,
+                window_id INTEGER,
+                model_type VARCHAR,
+                distribution VARCHAR,
+                parameters JSON,
+                forecast_path BLOB,
+                volatility_path BLOB,
+                FOREIGN KEY (window_id) REFERENCES forecast_windows (window_id)
+            );
+            
+            CREATE TABLE IF NOT EXISTS ensemble_stats (
+                stat_id INTEGER PRIMARY KEY,
+                window_id INTEGER,
+                horizon VARCHAR,
+                horizon_days INTEGER,
+                gev DOUBLE,
+                evoev DOUBLE,
+                dev DOUBLE,
+                kev DOUBLE,
+                sevts DOUBLE,
+                n_models INTEGER,
+                FOREIGN KEY (window_id) REFERENCES forecast_windows (window_id)
+            );
+        """)
+        
+        self.logger.info(f"Initialized database at {db_path}")
 
     def _connect(self):
         """Establish database connection"""
@@ -97,71 +133,80 @@ class GARCHDatabase:
             self.logger.error(f"Error initializing database tables: {str(e)}")
             raise
 
-    def store_forecast_window(self, window: ForecastWindow, index_id: str):
-        """Store forecast window with automatic reconnection"""
+    def store_forecast_window(self, window: ForecastWindow, index_id: str) -> None:
+        """Store forecast window in database
+        
+        Args:
+            window: ForecastWindow object containing the results
+            index_id: Identifier for the market index (e.g., 'SPX')
+        """
         try:
-            self._connect()  # Ensure connection is active
-            # Define horizons dictionary
-            horizons = {
-                '1M': 21, '2M': 42, '3M': 63, 
-                '6M': 126, '12M': 252
-            }
+            # Get next window ID
+            window_id = self.get_next_window_id()
             
-            # Store basic window info
-            result = self.conn.execute("""
-                INSERT INTO forecast_windows (start_date, end_date, index_id, returns)
-                VALUES (?, ?, ?, ?)
-                RETURNING window_id
+            # Store window data
+            self.conn.execute("""
+                INSERT INTO forecast_windows (
+                    window_id, index_id, start_date, end_date, returns
+                ) VALUES (?, ?, ?, ?, ?)
             """, (
-                window.start_date.strftime('%Y-%m-%d %H:%M:%S'),
-                window.end_date.strftime('%Y-%m-%d %H:%M:%S'),
-                str(index_id),
-                window.returns.astype(np.float64).tobytes()
-            )).fetchone()
+                window_id,
+                index_id,
+                pd.Timestamp(window.start_date),
+                pd.Timestamp(window.end_date),
+                window.returns.tobytes()
+            ))
             
-            window_id = int(result[0])
+            # Store GARCH results if available
+            if window.garch_results:
+                for result in window.garch_results:
+                    self.conn.execute("""
+                        INSERT INTO garch_results (
+                            window_id, model_type, distribution, parameters,
+                            forecast_path, volatility_path
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                    """, (
+                        window_id,
+                        result.model_type,
+                        result.distribution,
+                        json.dumps(result.params),
+                        result.forecast_path.tobytes(),
+                        result.volatility_path.tobytes()
+                    ))
             
-            # Store GARCH results with mean forecast paths
-            for result in window.garch_results:
-                self.conn.execute("""
-                    INSERT INTO garch_results (
-                        window_id, model_type, distribution, parameters,
-                        forecast_path, volatility_path
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                """, (
-                    window_id,
-                    str(result.model_type),
-                    str(result.distribution),
-                    json.dumps(result.params),
-                    result.forecast_path.astype(np.float64).tobytes(),
-                    result.volatility_path.astype(np.float64).tobytes()
-                ))
-            
-            # Store ensemble stats for each horizon
-            for horizon, stats in window.ensemble_stats.items():
-                self.conn.execute("""
-                    INSERT INTO ensemble_stats (
-                        window_id, horizon, horizon_days,
-                        gev, evoev, dev, kev, sevts, n_models
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    window_id,
-                    str(horizon),
-                    int(horizons[horizon]),  # Now horizons is defined
-                    float(stats['GEV']),
-                    float(stats['EVOEV']),
-                    float(stats['DEV']),
-                    float(stats['KEV']),
-                    float(stats['SEVTS']),
-                    int(stats['n_models'])
-                ))
+            # Store ensemble stats if available
+            if window.ensemble_stats:
+                for horizon, stats in window.ensemble_stats.items():
+                    # Extract horizon days from string (e.g., 'T21' -> 21)
+                    try:
+                        horizon_days = int(horizon.replace('T', ''))
+                    except ValueError:
+                        self.logger.warning(f"Invalid horizon format: {horizon}, skipping")
+                        continue
+                        
+                    self.conn.execute("""
+                        INSERT INTO ensemble_stats (
+                            window_id, horizon, horizon_days,
+                            gev, evoev, dev, kev, sevts, n_models
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        window_id,
+                        horizon,
+                        horizon_days,
+                        float(stats['gev']),
+                        float(stats['evoev']),
+                        float(stats['dev']),
+                        float(stats['kev']),
+                        float(stats['sevts']),
+                        len(window.garch_results) if window.garch_results else 0
+                    ))
             
             self.conn.commit()
-            return window_id
-                
+            self.logger.info(f"Stored forecast window for {index_id} at {window.end_date}")
+            
         except Exception as e:
             self.logger.error(f"Error storing forecast window: {str(e)}")
-            self._connect()  # Try to reconnect
+            self.conn.rollback()
             raise
 
     def get_ensemble_stats_series(self,
@@ -200,3 +245,54 @@ class GARCHDatabase:
         """Close database connection"""
         if hasattr(self, 'conn'):
             self.conn.close()
+
+    def create_expanding_windows(self,
+                              data: pd.DataFrame,
+                              min_train_size: int = 3000,
+                              test_size: int = 504,
+                              step_size: int = 21
+                              ) -> List[Tuple[pd.DataFrame, pd.DataFrame]]:
+        """Create expanding windows of training and test data"""
+        # Ensure data is sorted by date and has datetime index
+        if not isinstance(data.index, pd.DatetimeIndex):
+            if 'date' in data.columns:
+                data = data.set_index(pd.to_datetime(data['date']))
+            else:
+                raise ValueError("Data must have either a datetime index or a 'date' column")
+        
+        data = data.sort_index()
+        
+        if len(data) < (min_train_size + test_size):
+            raise ValueError(
+                f"Insufficient data: {len(data)} rows, "
+                f"need at least {min_train_size + test_size}"
+            )
+        
+        windows = []
+        start_idx = 0
+        
+        while (start_idx + min_train_size + test_size) <= len(data):
+            # Get date-based slices
+            train_end = data.index[start_idx + min_train_size - 1]
+            test_end = data.index[start_idx + min_train_size + test_size - 1]
+            
+            train = data.loc[:train_end]
+            test = data.loc[train_end:test_end]
+            
+            # Validate window dates
+            if pd.Timestamp(train.index[0]).year < 1980 or pd.Timestamp(test.index[-1]).year < 1980:
+                self.logger.error(f"Invalid dates detected: train={train.index[0]}, test={test.index[-1]}")
+                continue
+            
+            windows.append((train, test))
+            start_idx += step_size
+        
+        return windows
+
+    def get_next_window_id(self) -> int:
+        """Get next available window ID"""
+        result = self.conn.execute("""
+            SELECT COALESCE(MAX(window_id), 0) + 1
+            FROM forecast_windows
+        """).fetchone()
+        return result[0]

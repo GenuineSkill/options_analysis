@@ -1,6 +1,11 @@
 import duckdb
 from pathlib import Path
 
+# Window parameters
+TRAIN_YEARS = 12  # Update from 5 to 12
+TEST_YEARS = 2
+TRAIN_DAYS = int(TRAIN_YEARS * 252)  # ~3024 days
+
 def show_consecutive_windows():
     """Show details for consecutive window_ids"""
     db_path = Path("results/historical/historical_results.db")
