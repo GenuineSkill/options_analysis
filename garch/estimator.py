@@ -512,67 +512,58 @@ Window diagnostics for {date}:
         
         return base_values
 
-    def calculate_ensemble_stats(self, garch_results: List[GARCHResult], tau: int = 21) -> Dict[str, Dict[str, float]]:
-        """Calculate ensemble statistics from GARCH model forecasts
-        
-        Args:
-            garch_results: List of GARCH model results
-            tau: Forecast horizon in trading days
-            
-        Returns:
-            Dictionary with horizon keys (e.g., 'T21') containing dictionaries of statistics
-        """
+    def calculate_ensemble_stats(self, garch_results: List[GARCHResult], 
+                               horizons: List[int] = [21, 42, 63, 126, 252]) -> Dict[str, Dict[str, float]]:
+        """Calculate ensemble statistics from GARCH model forecasts for multiple horizons"""
         if not garch_results:
             raise ValueError("No valid GARCH results provided")
         
         J = len(garch_results)  # Number of models
+        ensemble_stats = {}
         
-        # Extract forecast paths up to tau for all models
-        forecasts = np.array([result.forecast_path[:tau] for result in garch_results])  # Shape: (J, tau)
-        
-        # Calculate ensemble statistics
-        mean_forecast = np.mean(forecasts, axis=0)  # Average across models for each time point
-        gev = np.mean(forecasts)  # Overall mean
-        evoev = np.sqrt(np.mean((mean_forecast - gev) ** 2))
-        dev = np.mean([np.std(forecasts[:, t], ddof=1) for t in range(tau)])
-        kev = np.mean([stats.skew(forecasts[:, t]) for t in range(tau)])
-        slopes = (forecasts[:, -1] - forecasts[:, 0]) / tau
-        sevts = np.mean(slopes)
-        
-        # Log detailed statistics
-        self.logger.info(
-            f"\nDetailed ensemble statistics (tau={tau}):\n"
-            f"Cross-sectional statistics by time point:\n"
-            f"  Mean forecast: {mean_forecast}\n"
-            f"  Std devs: {[np.std(forecasts[:, t], ddof=1) for t in range(tau)]}\n"
-            f"  Skewness: {[stats.skew(forecasts[:, t]) for t in range(tau)]}\n"
-            f"Model-specific slopes:\n"
-            f"  {slopes}\n"
-            f"GEV calculation:\n"
-            f"  Total sum: {np.sum(forecasts)}\n"
-            f"  J * tau: {J * tau}\n"
-            f"  Final GEV: {gev:.2f}"
-        )
-        
-        # Store results by horizon
-        ensemble_stats = {
-            f'T{tau}': {
+        for tau in horizons:
+            # Extract forecast paths up to tau for all models
+            forecasts = np.array([result.forecast_path[:tau] for result in garch_results])  # Shape: (J, tau)
+            
+            # Calculate ensemble statistics for this horizon
+            mean_forecast = np.mean(forecasts, axis=0)  # Average across models for each time point
+            gev = np.mean(forecasts)  # Overall mean
+            evoev = np.sqrt(np.mean((mean_forecast - gev) ** 2))
+            dev = np.mean([np.std(forecasts[:, t], ddof=1) for t in range(tau)])
+            kev = np.mean([stats.skew(forecasts[:, t]) for t in range(tau)])
+            
+            # Calculate SEVTS without dividing by tau
+            total_changes = forecasts[:, -1] - forecasts[:, 0]  # End minus beginning for each model
+            sevts = np.mean(total_changes)  # Average across models
+            
+            # Log individual model changes
+            self.logger.info(
+                f"\nSEVTS calculation for horizon T{tau}:\n"
+                f"Individual model changes (end - start):\n"
+                + "\n".join(f"  Model {j}: {change:.2f}%" 
+                           for j, change in enumerate(total_changes))
+                + f"\nFinal SEVTS: {sevts:.2f}%"
+            )
+            
+            # Store results for this horizon
+            horizon_key = f'T{tau}'
+            ensemble_stats[horizon_key] = {
                 'gev': float(gev),
                 'evoev': float(evoev),
                 'dev': float(dev),
                 'kev': float(kev),
                 'sevts': float(sevts)
             }
-        }
-        
-        self.logger.info(
-            f"\nEnsemble statistics (tau={tau}):\n"
-            f"  GEV:   {gev:.1f}%  (Mean expected volatility)\n"
-            f"  EVOEV: {evoev:.1f}%  (Std dev of mean forecast deviations)\n"
-            f"  DEV:   {dev:.1f}%  (Mean cross-sectional std dev)\n"
-            f"  KEV:   {kev:.2f}  (Mean cross-sectional skewness)\n"
-            f"  SEVTS: {sevts:.2f}%/day  (Mean term structure slope)"
-        )
+            
+            # Log all statistics for this horizon
+            self.logger.info(
+                f"\nEnsemble statistics for {horizon_key} ({tau} days):\n"
+                f"  GEV:   {gev:.1f}%  (Mean expected volatility)\n"
+                f"  EVOEV: {evoev:.1f}%  (Std dev of mean forecast deviations)\n"
+                f"  DEV:   {dev:.1f}%  (Mean cross-sectional std dev)\n"
+                f"  KEV:   {kev:.2f}  (Mean cross-sectional skewness)\n"
+                f"  SEVTS: {sevts:.2f}%  (Mean total change in volatility)"
+            )
         
         return ensemble_stats
 

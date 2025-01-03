@@ -214,10 +214,10 @@ def process_index_data(index_data: pd.DataFrame,
                 index_id=index_id
             )
             
-            # Calculate ensemble statistics for 1-month horizon
+            # Calculate ensemble statistics for all option expiry horizons
             ensemble_stats = estimator.calculate_ensemble_stats(
                 garch_results,
-                tau=21  # 1-month horizon
+                horizons=[21, 42, 63, 126, 252]  # 1M, 2M, 3M, 6M, 12M
             )
             
             # Store results
