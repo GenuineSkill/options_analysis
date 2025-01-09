@@ -24,7 +24,7 @@ def load_data(db_path: str):
         'sevts': 'Skewness of Ensemble Volatility Term Structure'
     }
     
-    # Get date range
+    # Get date range and available horizons
     date_range = conn.execute("""
         SELECT 
             MIN(end_date)::DATE as earliest,
@@ -32,8 +32,15 @@ def load_data(db_path: str):
         FROM forecast_windows
     """).fetchone()
     
+    # Get available horizons
+    horizons = conn.execute("""
+        SELECT DISTINCT horizon, horizon_days
+        FROM ensemble_stats
+        ORDER BY horizon_days
+    """).df()
+    
     conn.close()
-    return ensemble_stats, date_range
+    return ensemble_stats, date_range, horizons
 
 def create_visualization():
     st.title("GARCH Ensemble Analysis Dashboard")
@@ -62,7 +69,7 @@ def create_visualization():
     
     if analysis_type == "Ensemble Statistics Time Series":
         # Load available statistics and date range
-        ensemble_stats, date_range = load_data(str(db_path))
+        ensemble_stats, date_range, horizons = load_data(str(db_path))
         
         # Statistic selection
         stat_name = st.sidebar.selectbox(
@@ -74,7 +81,8 @@ def create_visualization():
         # Horizon selection
         horizon = st.sidebar.selectbox(
             "Select Horizon",
-            options=['1M', '2M', '3M', '6M', '12M']
+            options=horizons['horizon'].tolist(),
+            format_func=lambda x: f"{x} ({horizons[horizons['horizon'] == x]['horizon_days'].iloc[0]} days)"
         )
         
         # Date range selection
@@ -124,25 +132,32 @@ def create_visualization():
     elif analysis_type == "Model Performance Comparison":
         # Query model performance
         query = """
+            WITH parsed_models AS (
+                SELECT 
+                    model_type,
+                    distribution,
+                    TRY_CAST(parameters::json->>'o' AS INTEGER) as o_param
+                FROM garch_results
+            )
             SELECT 
                 CASE 
-                    WHEN model_type IN ('GARCH', 'garch') AND parameters::json->>'o' = '0' THEN 'GARCH'
+                    WHEN model_type IN ('GARCH', 'garch') AND o_param = 0 THEN 'GARCH'
                     WHEN model_type IN ('EGARCH', 'egarch') THEN 'EGARCH'
-                    WHEN model_type IN ('GARCH', 'garch') AND parameters::json->>'o' = '1' THEN 'GJR-GARCH'
+                    WHEN model_type IN ('GARCH', 'garch') AND o_param = 1 THEN 'GJR-GARCH'
                     ELSE upper(model_type)
                 END as model_type,
                 distribution,
-                COUNT(*) as n_estimates,
-                AVG(forecast_accuracy) as avg_accuracy
-            FROM garch_results
+                COUNT(*) as n_estimates
+            FROM parsed_models
             GROUP BY 
                 CASE 
-                    WHEN model_type IN ('GARCH', 'garch') AND parameters::json->>'o' = '0' THEN 'GARCH'
+                    WHEN model_type IN ('GARCH', 'garch') AND o_param = 0 THEN 'GARCH'
                     WHEN model_type IN ('EGARCH', 'egarch') THEN 'EGARCH'
-                    WHEN model_type IN ('GARCH', 'garch') AND parameters::json->>'o' = '1' THEN 'GJR-GARCH'
+                    WHEN model_type IN ('GARCH', 'garch') AND o_param = 1 THEN 'GJR-GARCH'
                     ELSE upper(model_type)
                 END,
                 distribution
+            ORDER BY model_type, distribution
         """
         
         df = conn.execute(query).df()
@@ -152,28 +167,47 @@ def create_visualization():
             x='model_type',
             y='n_estimates',
             color='distribution',
-            facet_col='index_id',
-            title="GARCH Model Usage by Type and Distribution"
+            title="GARCH Model Usage by Type and Distribution",
+            labels={
+                'model_type': 'Model Type',
+                'n_estimates': 'Number of Estimates',
+                'distribution': 'Error Distribution'
+            }
+        )
+        
+        # Improve layout
+        fig.update_layout(
+            xaxis_title="Model Type",
+            yaxis_title="Number of Estimates",
+            legend_title="Error Distribution",
+            barmode='group'
         )
         
         st.plotly_chart(fig)
         
     elif analysis_type == "Term Structure Analysis":
+        # Date selection for term structure
+        _, date_range, _ = load_data(str(db_path))
+        max_date = pd.to_datetime(date_range[1])
+        
+        selected_date = st.sidebar.date_input(
+            "Select Date",
+            value=max_date,
+            min_value=pd.to_datetime(date_range[0]),
+            max_value=max_date
+        )
+        
         # Query term structure data
-        query = """
+        query = f"""
             SELECT 
                 fw.end_date::DATE as date,
                 es.horizon,
+                es.horizon_days,
                 es.gev as volatility,
                 fw.index_id
             FROM forecast_windows fw
             JOIN ensemble_stats es ON fw.window_id = es.window_id
-            WHERE fw.end_date IN (
-                SELECT DISTINCT end_date 
-                FROM forecast_windows 
-                ORDER BY end_date DESC 
-                LIMIT 5
-            )
+            WHERE fw.end_date::DATE = DATE '{selected_date.strftime('%Y-%m-%d')}'
             ORDER BY fw.end_date, es.horizon_days
         """
         
@@ -181,11 +215,17 @@ def create_visualization():
         
         fig = px.line(
             df,
-            x='horizon',
+            x='horizon_days',
             y='volatility',
-            color='date',
-            facet_col='index_id',
-            title="Recent Volatility Term Structures"
+            color='index_id',
+            title=f"Volatility Term Structure ({selected_date})",
+            labels={'horizon_days': 'Days', 'volatility': 'Volatility (%)'}
+        )
+        
+        # Add hover text with horizon labels
+        fig.update_traces(
+            hovertemplate="Horizon: %{customdata}<br>Days: %{x}<br>Volatility: %{y:.1f}%",
+            customdata=df['horizon']
         )
         
         st.plotly_chart(fig)
@@ -207,9 +247,10 @@ def create_visualization():
                 'GARCH Results' as table_name,
                 COUNT(*) as record_count,
                 COUNT(DISTINCT model_type || distribution) as unique_models,
-                NULL as earliest_date,
-                NULL as latest_date
-            FROM garch_results
+                MIN(fw.end_date)::DATE as earliest_date,
+                MAX(fw.end_date)::DATE as latest_date
+            FROM garch_results gr
+            JOIN forecast_windows fw ON gr.window_id = fw.window_id
             
             UNION ALL
             
@@ -217,9 +258,10 @@ def create_visualization():
                 'Ensemble Stats' as table_name,
                 COUNT(*) as record_count,
                 COUNT(DISTINCT horizon) as unique_horizons,
-                NULL as earliest_date,
-                NULL as latest_date
-            FROM ensemble_stats
+                MIN(fw.end_date)::DATE as earliest_date,
+                MAX(fw.end_date)::DATE as latest_date
+            FROM ensemble_stats es
+            JOIN forecast_windows fw ON es.window_id = fw.window_id
         """).df()
         
         st.write("Database Overview")
@@ -228,19 +270,23 @@ def create_visualization():
         # Show sample of recent data
         st.write("Sample of Recent Data")
         recent = conn.execute("""
-            SELECT 
-                fw.end_date::DATE as date,
-                fw.index_id,
-                es.horizon,
-                es.gev,
-                es.evoev,
-                es.dev,
-                es.kev,
-                es.sevts
-            FROM forecast_windows fw
-            JOIN ensemble_stats es ON fw.window_id = es.window_id
-            WHERE fw.end_date >= (SELECT MAX(end_date) - INTERVAL '7 days' FROM forecast_windows)
-            ORDER BY fw.end_date DESC, fw.index_id, es.horizon
+            WITH recent_data AS (
+                SELECT 
+                    fw.end_date::DATE as date,
+                    fw.index_id,
+                    es.horizon,
+                    es.gev,
+                    es.evoev,
+                    COALESCE(es.dev, NULL) as dev,
+                    COALESCE(es.kev, NULL) as kev,
+                    es.sevts
+                FROM forecast_windows fw
+                JOIN ensemble_stats es ON fw.window_id = es.window_id
+                WHERE fw.end_date >= (SELECT MAX(end_date) - INTERVAL '7 days' FROM forecast_windows)
+            )
+            SELECT *
+            FROM recent_data
+            ORDER BY date DESC, index_id, horizon
             LIMIT 10
         """).df()
         
