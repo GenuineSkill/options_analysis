@@ -181,3 +181,240 @@ class RegressionVisualizer:
         except Exception as e:
             logger.error(f"Error saving plots: {str(e)}")
             raise
+            
+    def plot_error_correction(self,
+                             index_id: str,
+                             tenor: str,
+                             start_date: Optional[str] = None,
+                             end_date: Optional[str] = None) -> go.Figure:
+        """
+        Plot error correction model analysis
+        
+        Creates a multi-panel plot showing:
+        1. IV Changes vs Fitted Values
+        2. Error Correction Term and Signals
+        3. Coefficient Evolution
+        4. Signal Success Rates
+        """
+        try:
+            # Get error correction results
+            query = """
+                SELECT 
+                    date,
+                    delta_iv,
+                    fitted_change,
+                    error_correction,
+                    residual
+                FROM error_correction_results
+                WHERE index_id = ?
+                    AND tenor = ?
+                ORDER BY date
+            """
+            params = [index_id, tenor]
+            if start_date:
+                query += " AND date >= ?"
+                params.append(start_date)
+            if end_date:
+                query += " AND date <= ?"
+                params.append(end_date)
+            
+            data = self.reg.conn.execute(query, params).df()
+            
+            # Create subplots
+            fig = make_subplots(
+                rows=3, cols=2,
+                subplot_titles=(
+                    'IV Changes vs Fitted',
+                    'Error Correction Term',
+                    'Residual Distribution',
+                    'Signal Success Rate',
+                    'Coefficient Significance',
+                    'Model Performance'
+                ),
+                vertical_spacing=0.12,
+                horizontal_spacing=0.1,
+                specs=[
+                    [{"type": "scatter"}, {"type": "scatter"}],
+                    [{"type": "histogram"}, {"type": "bar"}],
+                    [{"type": "bar"}, {"type": "scatter"}]
+                ]
+            )
+            
+            # 1. IV Changes vs Fitted
+            fig.add_trace(
+                go.Scatter(
+                    x=data['date'],
+                    y=data['delta_iv'],
+                    name='Actual Changes',
+                    mode='markers',
+                    marker=dict(size=4, color='blue', opacity=0.6)
+                ),
+                row=1, col=1
+            )
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=data['date'],
+                    y=data['fitted_change'],
+                    name='Fitted Changes',
+                    mode='lines',
+                    line=dict(color='red', width=1)
+                ),
+                row=1, col=1
+            )
+            
+            # 2. Error Correction Term
+            fig.add_trace(
+                go.Scatter(
+                    x=data['date'],
+                    y=data['error_correction'],
+                    name='Error Correction',
+                    mode='lines+markers',
+                    marker=dict(size=4),
+                    line=dict(color='green', width=1)
+                ),
+                row=1, col=2
+            )
+            
+            # Add threshold lines
+            for z in [-2, 2]:
+                fig.add_shape(
+                    type='line',
+                    x0=data['date'].min(),
+                    x1=data['date'].max(),
+                    y0=z,
+                    y1=z,
+                    line=dict(color='gray', dash='dash'),
+                    row=1, col=2
+                )
+            
+            # 3. Residual Distribution
+            fig.add_trace(
+                go.Histogram(
+                    x=data['residual'],
+                    name='Residuals',
+                    nbinsx=30,
+                    marker_color='lightblue'
+                ),
+                row=2, col=1
+            )
+            
+            # 4. Signal Success Rate
+            signals = self.reg.get_trading_signals(index_id, tenor)
+            success_rates = []
+            for signal in [-1, 0, 1]:
+                signal_data = signals[signals['signal'] == signal]
+                if len(signal_data) > 0:
+                    if signal == 1:
+                        success = (signal_data['delta_iv'] > 0).mean()
+                        label = 'Buy'
+                    elif signal == -1:
+                        success = (signal_data['delta_iv'] < 0).mean()
+                        label = 'Sell'
+                    else:
+                        success = 0.5
+                        label = 'Hold'
+                    
+                    success_rates.append({
+                        'signal': label,
+                        'success_rate': success,
+                        'count': len(signal_data)
+                    })
+            
+            success_df = pd.DataFrame(success_rates)
+            fig.add_trace(
+                go.Bar(
+                    x=success_df['signal'],
+                    y=success_df['success_rate'],
+                    name='Success Rate',
+                    text=[f"{v:.1%}" for v in success_df['success_rate']],
+                    textposition='auto'
+                ),
+                row=2, col=2
+            )
+            
+            # 5. Coefficient Significance
+            coef_data = self.reg.conn.execute("""
+                SELECT 
+                    variable,
+                    coefficient,
+                    t_stat,
+                    ABS(t_stat) as abs_t_stat
+                FROM error_correction_coefficients
+                WHERE index_id = ?
+                    AND tenor = ?
+                    AND date = (SELECT MAX(date) 
+                               FROM error_correction_coefficients
+                               WHERE index_id = ?
+                                    AND tenor = ?)
+                ORDER BY abs_t_stat DESC
+            """, [index_id, tenor, index_id, tenor]).df()
+            
+            fig.add_trace(
+                go.Bar(
+                    x=coef_data['variable'],
+                    y=coef_data['t_stat'],
+                    name='t-statistics',
+                    text=[f"{v:.2f}" for v in coef_data['t_stat']],
+                    textposition='auto'
+                ),
+                row=3, col=1
+            )
+            
+            # Add significance lines
+            for t in [-1.96, 1.96]:
+                fig.add_shape(
+                    type='line',
+                    x0=-0.5,
+                    x1=len(coef_data)-0.5,
+                    y0=t,
+                    y1=t,
+                    line=dict(color='red', dash='dash'),
+                    row=3, col=1
+                )
+            
+            # 6. Model Performance Over Time
+            rolling_r2 = signals.rolling(window=63)['delta_iv'].corr(
+                signals['fitted_change']
+            )**2
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=signals['date'],
+                    y=rolling_r2,
+                    name='Rolling R²',
+                    line=dict(color='purple')
+                ),
+                row=3, col=2
+            )
+            
+            # Update layout
+            fig.update_layout(
+                height=1200,
+                width=1600,
+                title_text=f'Error Correction Analysis - {index_id} {tenor}',
+                showlegend=True,
+                template='plotly_white'
+            )
+            
+            # Add annotations for model statistics
+            stats_text = f"""
+            Observations: {len(data)}
+            R-squared: {data['delta_iv'].corr(data['fitted_change'])**2:.3f}
+            Mean EC: {data['error_correction'].mean():.3f}
+            EC Std: {data['error_correction'].std():.3f}
+            """
+            
+            fig.add_annotation(
+                text=stats_text,
+                xref="paper", yref="paper",
+                x=1.0, y=1.0,
+                showarrow=False,
+                align='left'
+            )
+            
+            return fig
+            
+        except Exception as e:
+            logger.error(f"Error creating error correction visualization: {str(e)}")
+            raise
