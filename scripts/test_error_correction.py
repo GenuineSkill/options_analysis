@@ -1,4 +1,4 @@
-"""Test script for error correction model"""
+"""Test script for error correction model with proper sequencing"""
 
 import logging
 from pathlib import Path
@@ -11,8 +11,10 @@ from datetime import datetime
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
 
+from regression.expanding_window import ExpandingWindowRegression
 from regression.error_correction import ErrorCorrectionModel
-from regression.level_regression import LevelRegression
+from regression.validation import verify_residual_storage, verify_temporal_consistency
+from workflows.run_regression_sequence import run_regression_sequence
 
 def analyze_model_stability(results: dict) -> pd.DataFrame:
     """Analyze stability of error correction model"""
@@ -71,102 +73,61 @@ def main():
         results_db = Path("results/historical/historical_results.db")
         conn = duckdb.connect(str(results_db))
         
-        # Initialize models
-        level_reg = LevelRegression(conn)
-        ec_model = ErrorCorrectionModel(conn, dev_mode=True)
-        
         # Test parameters
         index_id = 'SPX'
         tenors = ['1M', '2M', '3M', '6M', '12M']
+        dev_mode = True  # Explicitly set dev_mode to match ensemble stats
+        step_size = 21 if dev_mode else 1
+        
+        logger.info(f"""
+        Running tests with:
+        dev_mode: {dev_mode}
+        step_size: {step_size} days
+        """)
+        
+        # Create model with explicit dev_mode
+        ec_model = ErrorCorrectionModel(conn, dev_mode=dev_mode)
         
         # Store results for analysis
-        model_results = {}
-        signal_results = {}
-        stability_metrics = {}
+        all_results = {}
         
         for tenor in tenors:
             logger.info(f"\nProcessing {index_id} {tenor}")
             
             try:
-                # Ensure level regression results exist
-                level_results = level_reg.estimate(index_id, tenor)
-                
-                logger.info(f"""
-                Level regression complete:
-                R-squared: {level_results['r_squared']:.4f}
-                Observations: {level_results['nobs']}
-                """)
-                
-                # Run error correction model
-                ec_results = ec_model.estimate(index_id, tenor)
-                model_results[(index_id, tenor)] = ec_results
-                
-                logger.info(f"""
-                Error correction complete:
-                R-squared: {ec_results['r_squared']:.4f}
-                Observations: {ec_results['nobs']}
-                """)
-                
-                # Analyze model stability
-                stability = analyze_model_stability(ec_results)
-                stability_metrics[(index_id, tenor)] = stability
-                
-                logger.info("\nModel Stability:")
-                logger.info(stability)
-                
-                # Generate and analyze trading signals
-                signals = ec_model.get_trading_signals(
+                # Run complete regression sequence
+                results = run_regression_sequence(
+                    conn=conn,
                     index_id=index_id,
                     tenor=tenor,
-                    z_threshold=2.0
+                    min_window_size=126,
+                    step_size=21
                 )
                 
-                signal_analysis = analyze_signal_distribution(signals)
-                signal_results[(index_id, tenor)] = signal_analysis
+                all_results[(index_id, tenor)] = results
                 
-                logger.info("\nSignal Analysis:")
+                # Analyze results
+                analyze_model_stability(results['error_correction'])
+                signals = analyze_signal_distribution(
+                    results['error_correction']['signals']
+                )
+                
                 logger.info(f"""
-                Total signals: {signal_analysis['total_obs']}
-                Buy signals: {signal_analysis['buy_signals']} 
-                    (Success: {signal_analysis['success_rate']['buy']:.2%})
-                Sell signals: {signal_analysis['sell_signals']}
-                    (Success: {signal_analysis['success_rate']['sell']:.2%})
+                Analysis complete for {index_id} {tenor}:
+                Expanding Window R²: {results['expanding_window']['r_squared']:.4f}
+                Error Correction R²: {results['error_correction']['r_squared']:.4f}
+                EC Coefficient: {results['error_correction']['coefficients']['error_correction']['coefficient']:.4f}
+                EC t-stat: {results['error_correction']['coefficients']['error_correction']['t_stat']:.2f}
                 """)
                 
             except Exception as e:
                 logger.error(f"Error processing {index_id} {tenor}: {str(e)}")
                 continue
-        
-        # Save analysis results
-        if model_results and signal_results:
-            output_dir = Path("results/analysis")
-            output_dir.mkdir(parents=True, exist_ok=True)
+                
+        # Save results if successful
+        if all_results:
+            save_analysis_results(all_results)
             
-            # Save model stability metrics
-            stability_file = output_dir / "error_correction_stability.csv"
-            stability_df = pd.concat([
-                df.assign(index_id=idx[0], tenor=idx[1])
-                for idx, df in stability_metrics.items()
-            ])
-            stability_df.to_csv(stability_file, index=False)
-            
-            # Save signal analysis
-            signal_file = output_dir / "error_correction_signals.csv"
-            signal_df = pd.DataFrame([
-                {
-                    'index_id': idx[0],
-                    'tenor': idx[1],
-                    **analysis
-                }
-                for idx, analysis in signal_results.items()
-            ])
-            signal_df.to_csv(signal_file, index=False)
-            
-            logger.info(f"\nAnalysis results saved to {output_dir}")
-            
-        else:
-            logger.warning("No results to save")
-        
     except Exception as e:
         logger.error(f"Test failed: {str(e)}")
         raise
