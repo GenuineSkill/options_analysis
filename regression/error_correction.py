@@ -705,163 +705,38 @@ class ErrorCorrectionModel:
             raise
 
     def setup_forecast_windows(self):
-        """
-        Create and/or rebuild forecast windows while systematically removing references
-        to window_id=7 before deleting it, including logging for multi-col FKs and
-        enumerating all "window" columns as a fallback.
-        """
-        try:
-            # Check if forecast_windows exists
-            table_exists = self.conn.execute("""
-                SELECT COUNT(*) AS count
-                FROM sqlite_master
-                WHERE type='table'
-                  AND name='forecast_windows'
-            """).df()['count'].iloc[0] > 0
+        """Delete rows where window_id=7 from the relevant tables
 
-            if not table_exists:
-                # Nothing to do
+        Tables containing window_id column:
+            - garch_results
+            - ensemble_stats
+            - regression_residuals
+            - forecast_windows
+        
+        The first three tables have a FK reference to forecast_windows so
+        we need to delete from those first.
+        """
+        db_tables = self.conn.sql("FROM duckdb_tables()").df()
+        table_names = db_tables['table_name'].tolist()
+
+        # exit if forecast_windows table doesn't exist
+        # TODO: Why would you do this??
+        if 'forecast_windows' not in table_names:
                 logger.info("forecast_windows table does not exist. Skipping setup.")
                 return
-
-            self.conn.execute("BEGIN TRANSACTION")
-            try:
-                logger.info("Deleting rows referencing window_id=7 in child tables...")
-
-                # ─────────────────────────────────────────────────────────
-                # A) Enumerate all FOREIGN KEY constraints referencing forecast_windows
-                # ─────────────────────────────────────────────────────────
-                fk_constraints = self.conn.execute("""
-                    SELECT table_name, constraint_text
-                    FROM duckdb_constraints
-                    WHERE constraint_type = 'FOREIGN KEY'
-                      AND UPPER(referenced_table) = 'FORECAST_WINDOWS'
-                """).df()
-
-                if fk_constraints.empty:
-                    logger.info("No foreign keys referencing forecast_windows found in duckdb_constraints.")
-                else:
-                    logger.info("Found the following foreign keys referencing forecast_windows:")
-                    for idx, row in fk_constraints.iterrows():
-                        logger.info(f"  Table={row['table_name']}, Constraint Text={row['constraint_text']}")
-
-                for idx, row in fk_constraints.iterrows():
-                    child_table = row["table_name"]
-                    ctext = row["constraint_text"].upper()
-
-                    # Example ctext: "FOREIGN KEY(window_id, index_id) REFERENCES forecast_windows(window_id, index_id)"
-                    # or "FOREIGN KEY(window_id) REFERENCES forecast_windows(window_id)"
-
-                    # Parse out the (child columns)
-                    start_fk = ctext.find("FOREIGN KEY") + len("FOREIGN KEY")
-                    col_start = ctext.find("(", start_fk)
-                    col_end = ctext.find(")", col_start)
-                    if col_start == -1 or col_end == -1:
-                        logger.warning(f"Cannot parse referencing columns from {ctext}. Skipping.")
-                        continue
-
-                    referencing_cols_part = ctext[col_start+1:col_end].strip()  # e.g. "window_id, index_id"
-                    referencing_cols = [x.strip().strip('"') for x in referencing_cols_part.split(",")]
-
-                    if len(referencing_cols) > 1:
-                        # Multi-column foreign key. We either skip or try partial cleanup if "window_id" is among them.
-                        logger.warning(f"Multi-col FK in {child_table}: {referencing_cols}. Attempt partial cleanup if 'window_id' is included.")
-                        if "WINDOW_ID" in [x.upper() for x in referencing_cols]:
-                            # We'll do a partial DELETE in case it unblocks the constraint
-                            # But if the other column also participates in the constraint, you might still get an error
-                            try:
-                                before_cnt = self.conn.execute(f"""
-                                    SELECT COUNT(*) AS cnt
-                                    FROM {child_table}
-                                    WHERE window_id = 7
-                                """).df()['cnt'].iloc[0]
-                                if before_cnt > 0:
-                                    self.conn.execute(f"DELETE FROM {child_table} WHERE window_id = 7")
-                                    logger.info(f"Deleted {before_cnt} rows from {child_table} on window_id=7 (multi-col constraint).")
-                            except Exception as e:
-                                logger.error(f"Partial cleanup for multi-col FK in {child_table} failed: {str(e)}")
-                        else:
-                            logger.warning(f"No 'window_id' col in multi-col FK. You may need custom handling for {child_table}.")
-                    else:
-                        # Single-column foreign key references (typical case)
-                        referencing_col = referencing_cols[0]
-                        # Check that child_table actually has referencing_col
-                        try:
-                            table_cols = self.conn.execute(f"SELECT * FROM {child_table} LIMIT 0").df().columns
-                        except Exception as e:
-                            logger.warning(f"Could not read cols from {child_table}. Error: {str(e)}. Skipping.")
-                            continue
-
-                        if referencing_col.upper() not in [c.upper() for c in table_cols]:
-                            logger.warning(f"{child_table} does not contain {referencing_col}? Skipping.")
-                            continue
-
-                        # Delete child rows referencing window_id=7
-                        before_cnt = self.conn.execute(f"""
-                            SELECT COUNT(*) AS cnt
-                            FROM {child_table}
-                            WHERE {referencing_col} = 7
-                        """).df()['cnt'].iloc[0]
-                        if before_cnt > 0:
-                            self.conn.execute(f"DELETE FROM {child_table} WHERE {referencing_col} = 7")
-                            logger.info(f"Deleted {before_cnt} rows from {child_table}.{referencing_col}=7.")
-
-                # ─────────────────────────────────────────────────────────
-                # B) Fallback: Enumerate all tables whose columns contain "window"
-                #    (to catch columns not literally named "window_id")
-                # ─────────────────────────────────────────────────────────
-                logger.info("Fallback: checking all tables for columns containing 'window'.")
-                all_tables = self.conn.execute("""
-                    SELECT name
-                    FROM sqlite_master
-                    WHERE type='table'
-                """).df()['name'].tolist()
-
-                for tbl in all_tables:
-                    if tbl.lower() == 'forecast_windows':
-                        continue
-
-                    try:
-                        tbl_cols = self.conn.execute(f"SELECT * FROM {tbl} LIMIT 0").df().columns
-                    except Exception as e:
-                        logger.debug(f"Skipping table {tbl}, can't SELECT * LIMIT 0: {str(e)}")
-                        continue
-
-                    # If any col includes 'window' in its name, try a DELETE
-                    for c in tbl_cols:
-                        if 'window' in c.lower() and c.lower() != 'forecast_windows':
-                            # Attempt to delete if numeric
-                            # We'll guess that "window_id" or "windowID" or "my_window_col" might hold the ID
-                            try:
-                                before_cnt = self.conn.execute(f"""
-                                    SELECT COUNT(*) AS cnt
-                                    FROM {tbl}
-                                    WHERE {c} = 7
-                                """).df()['cnt'].iloc[0]
-                                if before_cnt > 0:
-                                    self.conn.execute(f"DELETE FROM {tbl} WHERE {c} = 7")
-                                    logger.info(f"[Fallback] Deleted {before_cnt} rows from {tbl}.{c}=7.")
-                            except Exception as e:
-                                logger.debug(f"[Fallback] Could not DELETE FROM {tbl} WHERE {c}=7. Possibly not numeric. Error: {str(e)}")
-
-                # ─────────────────────────────────────────────────────────
-                # C) Attempt final DELETE from forecast_windows
-                # ─────────────────────────────────────────────────────────
-                logger.info("Finally, deleting window_id=7 from forecast_windows.")
-                self.conn.execute("""
-                    DELETE FROM forecast_windows
-                    WHERE window_id = 7
-                """)
-                self.conn.execute("COMMIT")
-
-            except Exception as inner_e:
-                self.conn.execute("ROLLBACK")
-                logger.error(f"Error while clearing forecast_windows references: {str(inner_e)}")
-                raise
-
-        except Exception as outer_e:
-            logger.error(f"Error rebuilding forecast windows: {str(outer_e)}")
-            raise
+        
+        # We're going to delete all rows where window_id=7 in forecast_windows
+        # and the child tables that have a FK reference to window_id:
+        #  - garch_results
+        #  - ensemble_stats
+        #  - regression_residuals
+        logger.info("Deleting rows referencing window_id=7 forecast_windows and child tables")
+        self.conn.execute("""
+            DELETE FROM garch_results WHERE window_id=7;
+            DELETE FROM ensemble_stats WHERE window_id=7;
+            DELETE FROM regression_residuals WHERE window_id=7;
+            DELETE FROM forecast_windows WHERE window_id=7;
+        """)
 
     def verify_no_gaps_in_windows(self) -> bool:
         """Verify there are no gaps in window_id sequence in forecast_windows."""
